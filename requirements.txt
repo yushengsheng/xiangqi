@@ -1,0 +1,7 @@
+numpy>=1.21.0
+opencv-python>=4.5.0
+mss>=9.0.0
+Pillow>=9.0.0
+websockets>=11.0
+# Windows specific (install with pip install pywin32 on Windows)
+# pywin32; sys_platform == 'win32'
