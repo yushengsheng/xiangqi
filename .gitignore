@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+logs/
+config/*.json
+dist/
+*.zip
+/runtime/
+/venv/
+/.venv/
+.env
+.env.*
+*.pem
+*.key
+/test_images/tiantian_battle_desktop.png
+/test_images/tiantian_battle_live_now.png
+/test_images/tiantian_battle_red_top.png
