@@ -48,6 +48,7 @@ class MacCapture(BaseCapture):
         self._tiantian_source = "auto"
         self._source_bad_frames = 0
         self._last_window_probe = 0.0
+        self._last_adb_probe = 0.0
         self._probing_window = False
         self._quartz = None
         self._load_quartz()
@@ -113,7 +114,10 @@ class MacCapture(BaseCapture):
     def _detect_yyb_game(self, force: bool = False) -> str:
         """从应用宝 Android 前台 Activity 区分 JJ 象棋与天天象棋。"""
         now = time.monotonic()
-        if not force and now - self._game_checked_at < 1.0:
+        # 已经识别游戏后无需每秒启动一个 dumpsys 子进程。
+        # 未识别阶段仍保持 1 秒重试，切换已知游戏最多延迟 3 秒。
+        refresh_after = 3.0 if self.game_id in ("jj", "tiantian") else 1.0
+        if not force and now - self._game_checked_at < refresh_after:
             return self.game_id
         self._game_checked_at = now
         result = self._adb("shell", "dumpsys", "window", timeout=1.0, text=True)
@@ -143,7 +147,10 @@ class MacCapture(BaseCapture):
                         )
                 if self.game_id != previous_game:
                     self._adb_display_id = None
-                    self._tiantian_source = "auto"
+                    self._tiantian_source = (
+                        "adb" if self.game_id == "tiantian"
+                        and self._adb_path and self._adb_device else "auto"
+                    )
                     self._source_bad_frames = 0
                     self._probing_window = False
                 return self.game_id
@@ -258,7 +265,10 @@ class MacCapture(BaseCapture):
                 if needle in searchable:
                     if self.target_wid != window["id"]:
                         self._adb_display_id = None
-                        self._tiantian_source = "auto"
+                        self._tiantian_source = (
+                            "adb" if self.game_id == "tiantian"
+                            and self._adb_path and self._adb_device else "auto"
+                        )
                         self._source_bad_frames = 0
                         self._probing_window = False
                     self.target_window_info = window
@@ -291,20 +301,8 @@ class MacCapture(BaseCapture):
         """显式请求录屏；天天象棋使用应用宝画面通道，无需系统授权。"""
         self._detect_yyb_game(force=True)
         if self.game_id == "tiantian" and self._adb_path and self._adb_device:
-            if self._quartz is not None and self._quartz.CGPreflightScreenCaptureAccess():
-                self.permission_state = "granted"
-                self.last_error = None
-                return True
-            # 实战安全图层不出现在 ADB 截图中，因此优先争取一次宿主窗口权限；
-            # 用户拒绝时仍返回就绪并使用 ADB，不会阻断普通分析盘。
-            if self._quartz is not None:
-                try:
-                    if self._quartz.CGRequestScreenCaptureAccess():
-                        self.permission_state = "granted"
-                        self.last_error = None
-                        return True
-                except Exception:
-                    pass
+            # ADB 画面已包含完整实盘和落点光圈，不为天天象棋
+            # 额外申请可捕获整个桌面的 macOS 录屏权限。
             self.permission_state = "not_required"
             self.last_error = None
             return True
@@ -350,22 +348,26 @@ class MacCapture(BaseCapture):
             window_allowed = (
                 self._quartz is not None and self._quartz.CGPreflightScreenCaptureAccess()
             )
+            # 当前应用宝版本的 ADB 外部显示画面比宿主窗口更稳定，
+            # 且包含真人对局和最后一步光圈。只要 ADB 持续识别到双将就
+            # 保持该来源；ADB 失败或盘面无效时仍会自动回退窗口捕获。
             now = time.monotonic()
-            probe_window = (
-                window_allowed
-                and self._tiantian_source == "adb"
-                and now - self._last_window_probe >= 2.0
+            probe_adb = (
+                self._tiantian_source == "window"
+                and now - self._last_adb_probe >= 5.0
             )
-            if probe_window:
-                self._last_window_probe = now
-                self._probing_window = True
-            use_adb = not probe_window and (
-                self._tiantian_source == "adb" or not window_allowed
-            )
+            use_adb = self._tiantian_source == "adb" or not window_allowed or probe_adb
             if use_adb:
+                if probe_adb:
+                    self._last_adb_probe = now
                 frame = self._capture_tiantian_adb()
                 if frame is not None:
-                    self.find_target_window()
+                    # ADB 画面不依赖宿主窗口几何信息；低频刷新即可
+                    # 发现应用宝窗口重开，避免每帧枚举全部 macOS 窗口。
+                    now = time.monotonic()
+                    if now - self._last_window_probe >= 2.0:
+                        self._last_window_probe = now
+                        self.find_target_window()
                     return frame
                 self.last_error = "天天象棋 ADB 画面暂不可用，正在尝试窗口捕获"
 
@@ -441,7 +443,17 @@ class MacCapture(BaseCapture):
             return
         self._source_bad_frames += 1
         if self.capture_source == "yyb_adb":
-            if self._quartz is not None and self._quartz.CGPreflightScreenCaptureAccess():
+            # 截帧期间的过场动画偶尔会造成单帧缺子，不能因此
+            # 立即切换到几何不同的宿主窗口。只有连续失败才回退；
+            # 在 window 模式下的低频 ADB 探测失败则继续保持 window。
+            if self._tiantian_source == "window":
+                self._source_bad_frames = 0
+                return
+            if (
+                self._source_bad_frames >= 4
+                and self._quartz is not None
+                and self._quartz.CGPreflightScreenCaptureAccess()
+            ):
                 self._tiantian_source = "window"
                 self._source_bad_frames = 0
         elif self.capture_source == "coregraphics" and self._source_bad_frames >= 8:

@@ -30,6 +30,18 @@ class TiantianRecognizer:
             base_piece_radius=76,
         )
         self.adb_grid = BoardGrid(config)
+        # 应用宝/天天象棋新版将棋盘整体下移了 49px（以
+        # 1440x2560 原始画面为基准）。保留旧网格以兼容旧客户端，
+        # 识别时以双将完整性自动选择。
+        self.adb_shifted_grid = BoardGrid(BoardConfig(
+            base_width=1440,
+            base_height=2560,
+            x_min=109.0,
+            x_max=1331.0,
+            y_min=580.0,
+            y_max=1958.0,
+            base_piece_radius=76,
+        ))
         self.host_grid = BoardGrid(BoardConfig(
             base_width=880,
             base_height=1636,
@@ -48,6 +60,7 @@ class TiantianRecognizer:
             y_max=1238.0,
             base_piece_radius=42,
         ))
+        self._adb_grid_preference: Optional[BoardGrid] = None
         self._host_grid_preference: Optional[BoardGrid] = None
         self.grid = self.adb_grid
         self.capture_source = "unknown"
@@ -212,7 +225,24 @@ class TiantianRecognizer:
             or (self.capture_source == "unknown" and height < 2200)
         )
         if not host_frame:
-            return self._recognize_grid(image, self.adb_grid, self.adb_templates)
+            candidates = [self.adb_grid, self.adb_shifted_grid]
+            if self._adb_grid_preference in candidates:
+                candidates.remove(self._adb_grid_preference)
+                candidates.insert(0, self._adb_grid_preference)
+            best = None
+            for grid in candidates:
+                result = self._recognize_grid(image, grid, self.adb_templates)
+                if self._has_both_kings(result):
+                    self._adb_grid_preference = grid
+                    return result
+                score = (result["piece_count"], sum(
+                    item["confidence"] for item in result["pieces_detail"]
+                ))
+                if best is None or score > best[0]:
+                    best = (score, result, grid)
+            assert best is not None
+            self._adb_grid_preference = best[2] if best[1]["piece_count"] >= 2 else None
+            return best[1]
 
         candidates = [self.host_grid, self.host_machine_grid]
         if self._host_grid_preference in candidates:

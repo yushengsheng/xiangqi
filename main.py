@@ -57,7 +57,7 @@ def main():
     parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket 广播端口 (默认: 8765)")
     parser.add_argument("--http-port", type=int, default=8766, help="HTTP API 与 Web 看板端口 (默认: 8766；冲突时自动避让)")
     parser.add_argument("--runtime-file", default="logs/runtime.json", help="写入实际 HTTP/WebSocket 入口的运行时文件")
-    parser.add_argument("--interval", type=float, default=0.12, help="同步轮询间隔秒数 (默认: 0.12s，约 8 FPS)")
+    parser.add_argument("--interval", type=float, default=0.12, help="检测到画面变化时的快速轮询间隔 (默认: 0.12s；稳定时自动降频)")
     parser.add_argument("--idle-timeout", type=float, default=12.0, help="看板无 WebSocket 连接后自动退出秒数；0 表示不退出")
     parser.add_argument("--test-run", action="store_true", help="自检运行 1 秒后自动退出 (用于自动化回归测试)")
     parser.add_argument("--capture-once", metavar="PATH", help="抓取一帧并保存到 PATH 后退出，用于验证实时窗口采集")
@@ -90,10 +90,10 @@ def main():
             return float(default)
 
     ai_engine = args.ai_engine or saved_ai.get("engine_kind", "pikafish")
-    ai_time = args.ai_time if args.ai_time is not None else saved_number("time_ms", 1000) / 1000.0
+    ai_time = args.ai_time if args.ai_time is not None else saved_number("time_ms", 700) / 1000.0
     ai_depth = args.ai_depth if args.ai_depth is not None else saved_number("max_depth", 60)
-    ai_threads = args.ai_threads if args.ai_threads is not None else saved_number("engine_threads", 2)
-    ai_hash = args.ai_hash if args.ai_hash is not None else saved_number("engine_hash_mb", 64)
+    ai_threads = args.ai_threads if args.ai_threads is not None else saved_number("engine_threads", 1)
+    ai_hash = args.ai_hash if args.ai_hash is not None else saved_number("engine_hash_mb", 32)
 
     # 1. 仅列出窗口
     if args.list_windows:

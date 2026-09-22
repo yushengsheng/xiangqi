@@ -12,7 +12,7 @@ rm -rf "$STAGE" "$ZIP"
 mkdir -p "$STAGE"
 
 ITEMS=(
-  README.md RELEASE_NOTES.md requirements.txt python.sh launcher.sh stop.sh main.py run_regression_tests.py
+  README.md RELEASE_NOTES.md requirements.txt requirements-macos.lock python.sh launcher.sh stop.sh main.py run_regression_tests.py
   AppIcon.icns .gitignore capture core server templates test_images tests engines runtime packaging
   "象棋盘面同步.app" "停止服务.app"
 )

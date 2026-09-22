@@ -15,10 +15,13 @@ Git 仓库包含源码、识别模板、回归图片、原生启动器及 Pikafi
 ```bash
 git clone https://github.com/yushengsheng/xiangqi.git
 cd xiangqi
-python3 -m venv venv
-./venv/bin/python -m pip install -r requirements.txt pyobjc-framework-Quartz
+python3.11 -m venv venv
+./venv/bin/python -m pip install --upgrade "pip>=26.2.1" "setuptools>=84.0.0"
+./venv/bin/python -m pip install --only-binary=:all: --require-hashes -r requirements-macos.lock
 ./python.sh main.py
 ```
+
+`requirements-macos.lock` 锁定 macOS/Python 3.11 依赖及发布包哈希，避免重装时静默换用其他构建；`requirements.txt` 保留为直接依赖清单。
 
 源码启动自动使用 `venv/`；自包含发布包优先使用随包的 `runtime/`。`build_release.sh` 和完整启动器回归依赖自包含运行时，源码仓库本身不提供它；不要将虚拟环境或个人配置提交到仓库。
 
@@ -36,7 +39,7 @@ Window ID 在客户端重开后会变化；正常双击启动会按标题自动�
 ./python.sh main.py --window-id <当前ID> --capture-once logs/manual_capture.png
 ```
 
-打开保存的图片，必须能看到当前象棋盘面。若命令报告未授予录屏权限，请在 macOS「系统设置 → 隐私与安全性 → 屏幕录制」中允许“象棋盘面同步”；授权后重新启动。天天象棋人机盘可直接使用应用宝画面通道，真人对战使用 macOS 宿主窗口画面，因此真人盘必须保留录屏授权。
+打开保存的图片，必须能看到当前象棋盘面。若命令报告未授予录屏权限，请在 macOS「系统设置 → 隐私与安全性 → 屏幕录制」中允许“象棋盘面同步”；授权后重新启动。天天象棋优先使用应用宝 ADB 本地画面通道，不主动申请录屏权限；JJ 象棋或 ADB 不可用时的窗口捕获才需要该权限。
 
 确认抓帧正确后，首次为当前 UI 标定棋盘。弹出的窗口中按 **左上、右上、右下、左下** 的顺序点击棋盘最外层四个交叉点，按 Enter 保存（R 重置，Esc 取消）：
 
@@ -59,6 +62,7 @@ Window ID 在客户端重开后会变化；正常双击启动会按标题自动�
 - WebSocket：`ws://127.0.0.1:8765`
 
 看板或 `/status` 中的 `capture_status` 必须是 `ok`；`error` 时请查看 `capture_info.last_error`，不要使用旧 FEN。
+稳定棋盘会自动降低截图频率，发现候选走子后会立即恢复快速双帧确认；无需手动调低 `--interval`。
 
 ## 下方 AI 对战
 
@@ -68,11 +72,11 @@ Window ID 在客户端重开后会变化；正常双击启动会按标题自动�
 - 棋盘模拟：点击「棋盘模拟」后只在网页棋盘中对弈，你走**上方**棋子，AI 自动走下方；真实对局请保持“跟随实盘”，避免把模拟盘误当实时盘。
 - 若实盘是执黑翻面，下方变成黑方，AI 仍然执下；标准开局始终红先。天天中盘可用连续两帧确认的来源/落点标记恢复回合，没有可靠标记时等待真实走子，不猜测先手。
 - 捕获漏掉中间帧时，从上一稳定布局推演最多两个合法半回合（含吃子），整批追上实盘；顺序影响回合且无可靠证据时保持等待。
-- 看板提供“普通 / 进阶 / 高级”三档 AI 强度，选择后立即生效；命令行仍可精细设置时间、深度、线程和 Hash。
+- 看板提供“节能 / 普通 / 进阶 / 高级”四档 AI 强度，默认节能档只使用 1 个搜索线程；命令行仍可精细设置。
 - 黑方位于下方时，程序会把盘面和 Pikafish 着法双向旋转 180°，引擎始终接收标准象棋 FEN。
 
 ```bash
-./python.sh main.py --window-id <当前ID>      # 默认 Pikafish：2线程 / 64MB Hash
+./python.sh main.py --window-id <当前ID>      # 默认节能档：1线程 / 32MB Hash
 ./python.sh main.py --mode mock --ai-time 1.2 --ai-threads 2 --ai-hash 64
 ./python.sh main.py --mode mock --ai-engine builtin
 ./python.sh main.py --mode mock --no-ai      # 只要同步、不要 AI

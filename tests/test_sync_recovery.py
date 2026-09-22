@@ -289,6 +289,17 @@ class RecoveryTests(unittest.TestCase):
         self.assertIsNone(capture._adb_display_id)
         self.assertIn("解码失败", capture.last_error)
 
+    def test_tiantian_adb_does_not_request_screen_permission(self):
+        capture = self.capture()
+        capture.game_id = "tiantian"
+        capture._detect_yyb_game = Mock(return_value="tiantian")
+        capture._adb_path = "/existing/adb"
+        capture._adb_device = "emulator-5554"
+        capture._quartz = Mock()
+        self.assertTrue(capture.request_screen_permission())
+        self.assertEqual(capture.permission_state, "not_required")
+        capture._quartz.CGRequestScreenCaptureAccess.assert_not_called()
+
     def test_window_reopen_discards_old_source_cache(self):
         capture = self.capture()
         capture.target_wid = 1
@@ -304,7 +315,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertIsNone(capture.find_target_window())
         self.assertIsNone(capture.target_window_info)
 
-    def test_host_failure_fallback_and_probe_recovery(self):
+    def test_host_failure_fallback_and_adb_stability(self):
         capture = self.capture()
         capture.game_id = "tiantian"
         capture._detect_yyb_game = Mock()
@@ -318,11 +329,26 @@ class RecoveryTests(unittest.TestCase):
         capture._capture_tiantian_adb = Mock(return_value=frame)
         capture._last_window_probe = time.monotonic()
         self.assertIs(capture.capture(), frame)
+        window_capture_calls = capture._cgimage_to_bgr.call_count
+        # ADB 可持续识别时不应定时切回几何已变化的宿主窗口。
         capture._last_window_probe = time.monotonic() - 3
-        capture._cgimage_to_bgr.return_value = frame
-        self.assertIsNotNone(capture.capture())
-        self.assertEqual(capture.capture_source, "coregraphics")
+        self.assertIs(capture.capture(), frame)
+        self.assertEqual(capture._cgimage_to_bgr.call_count, window_capture_calls)
+        capture.capture_source = "yyb_adb"  # 真实 _capture_tiantian_adb 会设置来源。
         capture.report_recognition(32, True)
+        self.assertEqual(capture._tiantian_source, "adb")
+
+    def test_adb_requires_consecutive_bad_frames_before_window_fallback(self):
+        capture = self.capture()
+        capture.game_id = "tiantian"
+        capture._tiantian_source = "adb"
+        capture.capture_source = "yyb_adb"
+        capture._quartz = Mock()
+        capture._quartz.CGPreflightScreenCaptureAccess.return_value = True
+        for _ in range(3):
+            capture.report_recognition(18, False)
+            self.assertEqual(capture._tiantian_source, "adb")
+        capture.report_recognition(18, False)
         self.assertEqual(capture._tiantian_source, "window")
 
     def test_capture_pipeline_hint_and_live_overlay(self):
@@ -358,6 +384,43 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(state["board"], middle)
         finally:
             server.stop()
+
+    def test_adaptive_polling_slows_only_stable_frames(self):
+        server = SyncServer(
+            MockCapture(["test_images/board_test_01.png"]),
+            ai_enabled=False, idle_timeout=0, interval=0.12,
+        )
+        self.assertEqual(
+            server._effective_poll_interval({"source": "mock"}, has_stable_board=True),
+            0.12,
+        )
+        self.assertEqual(
+            server._effective_poll_interval({"source": "coregraphics"}, has_stable_board=True),
+            0.30,
+        )
+        self.assertEqual(
+            server._effective_poll_interval({"source": "coregraphics"}),
+            0.5,
+        )
+        self.assertEqual(
+            server._effective_poll_interval({"source": "yyb_adb"}, has_stable_board=True),
+            0.75,
+        )
+        self.assertEqual(
+            server._effective_poll_interval(
+                {"source": "yyb_adb"}, has_stable_board=True, recognition_pending=True,
+            ),
+            0.12,
+        )
+        stable = [[None] * 9 for _ in range(10)]
+        stable[3][0] = "r_p"
+        moved_board = [row[:] for row in stable]
+        moved_board[3][0] = None
+        moved_board[4][0] = "r_p"
+        noisy_board = [row[:] for row in stable]
+        noisy_board[3][0] = None
+        self.assertTrue(server._looks_like_single_move(stable, moved_board))
+        self.assertFalse(server._looks_like_single_move(stable, noisy_board))
 
 
 def run_recovery_tests():

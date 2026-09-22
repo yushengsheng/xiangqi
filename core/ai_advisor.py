@@ -30,10 +30,10 @@ OnUpdate = Callable[[], None]
 
 
 class AIAdvisor:
-    def __init__(self, time_ms: int = 1000, max_depth: int = 60,
+    def __init__(self, time_ms: int = 700, max_depth: int = 60,
                  enabled: bool = True, on_update: Optional[OnUpdate] = None,
-                 engine_kind: str = "pikafish", engine_threads: int = 2,
-                 engine_hash_mb: int = 64):
+                 engine_kind: str = "pikafish", engine_threads: int = 1,
+                 engine_hash_mb: int = 32):
         self.time_ms = time_ms
         self.max_depth = max_depth
         self.enabled = enabled

@@ -172,6 +172,15 @@ def test_recognizer_accuracy():
     assert tt_selected["piece_count"] == 32
     assert tt_selected["board"][6][1] == "b_c" and tt_selected["board"][2][1] is None
 
+    # 2026-09 应用宝画面更新后棋盘整体下移 49px；新旧布局应自动选择。
+    shifted_adb = cv2.warpAffine(
+        cv2.imread("test_images/tiantian_adb.png"),
+        np.float32([[1, 0, 0], [0, 1, 49]]),
+        (1440, 2560),
+    )
+    tt_shifted = tiantian.recognize(shifted_adb)
+    assert tt_shifted["piece_count"] == 32 and tt_shifted["fen"] == START_FEN
+
     tiantian.capture_source = "coregraphics"
     tt_machine_host = tiantian.recognize(cv2.imread("test_images/tiantian_host_probe.png"))
     expected_machine_host = "1rbakabnr/9/1cn4c1/p1p1p1p1p/9/2P6/P3P1P1P/4C2C1/9/RNBAKABNR w - - 0 1"
@@ -586,7 +595,7 @@ def test_sync_server_end_to_end():
             assert "楚 河" in html_body and "最新 FEN" not in html_body
             assert "AI 执下方" in html_body and "回退一步" in html_body
             assert "AI 强度" in html_body and "选择后立即生效" in html_body
-            assert "普通" in html_body and "进阶" in html_body and "高级" in html_body
+            assert "节能" in html_body and "普通" in html_body and "进阶" in html_body and "高级" in html_body
             assert "Pikafish" in html_body
 
         # 4. AI 回退接口存在并返回结构化状态。

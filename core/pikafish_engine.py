@@ -7,6 +7,7 @@ rotated 180 degrees before search and all returned moves are rotated back.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import queue
@@ -32,6 +33,10 @@ from core.xiangqi import (
 
 class PikafishError(RuntimeError):
     pass
+
+
+PIKAFISH_BINARY_SHA256 = "3a11f9034ef723bb4068e4cf88a79a12d99507474ba118fa916ec2cecd4f4abe"
+PIKAFISH_NNUE_SHA256 = "7d13d73569a9b571ba0eb20cf1596247bc2a42738967e61afef6482b231e900e"
 
 
 def rotate_board_180(board: Board) -> Board:
@@ -73,6 +78,7 @@ class PikafishEngine:
         self._new_game_pending = True
         self._last_error: Optional[str] = None
         self._engine_name = "Pikafish"
+        self._integrity_ok: Optional[bool] = None
 
     @property
     def name(self) -> str:
@@ -83,11 +89,34 @@ class PikafishEngine:
         return self._last_error
 
     def is_available(self) -> bool:
-        return (
+        resources_exist = (
             self.binary_path.is_file()
             and os.access(self.binary_path, os.X_OK)
             and self.nnue_path.is_file()
         )
+        if not resources_exist:
+            return False
+        if self._integrity_ok is None:
+            actual_binary = self._sha256(self.binary_path)
+            actual_nnue = self._sha256(self.nnue_path)
+            self._integrity_ok = (
+                actual_binary == PIKAFISH_BINARY_SHA256
+                and actual_nnue == PIKAFISH_NNUE_SHA256
+            )
+            if not self._integrity_ok:
+                self._last_error = (
+                    "Pikafish 完整性校验失败，已拒绝启动："
+                    f"binary={actual_binary}, nnue={actual_nnue}"
+                )
+        return bool(self._integrity_ok)
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def configure(self, threads: Optional[int] = None,
                   hash_mb: Optional[int] = None) -> None:
@@ -166,7 +195,8 @@ class PikafishEngine:
                 return
             if not self.is_available():
                 raise PikafishError(
-                    f"缺少 Pikafish 资源: {self.binary_path} / {self.nnue_path}"
+                    self._last_error
+                    or f"缺少 Pikafish 资源: {self.binary_path} / {self.nnue_path}"
                 )
             self.close()
             self._lines = queue.Queue()

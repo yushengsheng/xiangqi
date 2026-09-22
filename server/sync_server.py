@@ -291,11 +291,11 @@ class SyncServer:
                  interval: float = 0.12,
                  idle_timeout: float = 12.0,
                  ai_enabled: bool = True,
-                 ai_time_ms: int = 1000,
+                 ai_time_ms: int = 700,
                  ai_max_depth: int = 60,
                  ai_engine: str = "pikafish",
-                 ai_threads: int = 2,
-                 ai_hash_mb: int = 64,
+                 ai_threads: int = 1,
+                 ai_hash_mb: int = 32,
                  ai_settings_path: Optional[str] = None):
         self.capture = capture
         self.recognizer = recognizer or BoardRecognizer()
@@ -348,6 +348,49 @@ class SyncServer:
             on_update=self._on_ai_update,
         )
         self._latest_state["ai"] = self.advisor.snapshot()
+
+    def _effective_poll_interval(
+        self,
+        capture_info: Optional[Dict[str, Any]] = None,
+        *,
+        has_stable_board: bool = False,
+        recognition_pending: bool = False,
+    ) -> float:
+        """根据画面来源自适应降频。
+
+        棋盘稳定时无需持续满速截图；一旦发现候选变化，下一帧
+        立即恢复快速轮询以完成双帧确认。
+        """
+        source = (capture_info or {}).get("source")
+        if recognition_pending:
+            return self.interval
+        if not has_stable_board and source in ("yyb_adb", "coregraphics"):
+            return max(self.interval, 0.5)
+        if source == "yyb_adb":
+            return max(self.interval, 0.75)
+        if source == "coregraphics" and has_stable_board:
+            return max(self.interval, 0.30)
+        return self.interval
+
+    @staticmethod
+    def _looks_like_single_move(stable_board, observed_board) -> bool:
+        """仅对“一个来源格 + 一个目标格”的候选快速补帧。"""
+        if stable_board is None or observed_board is None:
+            return False
+        differences = [
+            (row, col, stable_board[row][col], observed_board[row][col])
+            for row in range(10) for col in range(9)
+            if stable_board[row][col] != observed_board[row][col]
+        ]
+        if len(differences) != 2:
+            return False
+        departures = [item for item in differences if item[2] is not None and item[3] is None]
+        destinations = [item for item in differences if item[3] is not None and item[3] != item[2]]
+        return (
+            len(departures) == 1
+            and len(destinations) == 1
+            and departures[0][2] == destinations[0][3]
+        )
 
     def get_latest_state(self) -> Dict[str, Any]:
         with self._lock:
@@ -505,6 +548,7 @@ class SyncServer:
         frame_times = []
         while not self._stop_event.is_set():
             t_start = time.perf_counter()
+            poll_interval = self.interval
             frame = self.capture.capture()
             if frame is not None:
                 try:
@@ -537,6 +581,9 @@ class SyncServer:
                     )
                     stable_fen, stable_board = self.debouncer.get_stable_state()
                     if stable_fen is None or stable_board is None:
+                        poll_interval = self._effective_poll_interval(
+                            capture_info, has_stable_board=False, recognition_pending=False,
+                        )
                         self._update_state({
                             "raw_piece_count": raw_piece_count,
                             "recognition_pending": True,
@@ -546,9 +593,10 @@ class SyncServer:
                             "game_id": rec_result.get("game_id", game_id),
                             "game_name": rec_result.get("game_name", capture_info.get("game_name", "象棋")),
                             "frame_resolution": f"{frame.shape[1]}x{frame.shape[0]}",
+                            "poll_interval": poll_interval,
                         })
                         elapsed = time.perf_counter() - t_start
-                        time.sleep(max(0.01, self.interval - elapsed))
+                        self._stop_event.wait(max(0.01, poll_interval - elapsed))
                         continue
                     piece_count = sum(1 for row in stable_board for piece in row if piece is not None)
 
@@ -559,13 +607,26 @@ class SyncServer:
                     frame_times = [t for t in frame_times if now_perf - t <= 2.0]
                     fps = len(frame_times) / 2.0 if len(frame_times) > 1 else 1.0 / self.interval
 
+                    recognition_pending = rec_result["board"] != stable_board
+                    fast_confirmation = self._looks_like_single_move(
+                        stable_board, rec_result["board"]
+                    )
+                    poll_interval = self._effective_poll_interval(
+                        capture_info,
+                        has_stable_board=True,
+                        recognition_pending=fast_confirmation,
+                    )
+
                     state_update = {
                         "fen": stable_fen,
                         "board": stable_board,
                         "text_board": board_to_text(stable_board),
                         "piece_count": piece_count,
                         "raw_piece_count": raw_piece_count,
-                        "recognition_pending": rec_result["board"] != stable_board,
+                        "recognition_pending": recognition_pending,
+                        "recognition_rejection": (
+                            self.debouncer.last_rejection_reason if recognition_pending else None
+                        ),
                         "session_revision": self.debouncer.session_revision,
                         "timestamp": now,
                         "fps": round(fps, 1),
@@ -573,6 +634,7 @@ class SyncServer:
                         "last_frame_at": now,
                         "frame_resolution": f"{frame.shape[1]}x{frame.shape[0]}",
                         "capture_info": capture_info,
+                        "poll_interval": poll_interval,
                         "game_id": rec_result.get("game_id", self._active_game_id),
                         "game_name": rec_result.get("game_name", capture_info.get("game_name", "象棋")),
                         "side_to_move": self.debouncer.active_side,
@@ -602,16 +664,18 @@ class SyncServer:
                     print(f"[SyncServer] Recognition error: {e}")
             else:
                 capture_info = self.capture.get_info()
+                poll_interval = self._effective_poll_interval(capture_info)
                 capture_error = capture_info.get("last_error")
                 self._update_state({
                     "capture_status": "error",
                     "capture_info": capture_info,
+                    "poll_interval": poll_interval,
                     "description": capture_error or "未获取到画面帧（窗口可能已关闭、最小化或权限受限）"
                 })
 
             t_elapsed = time.perf_counter() - t_start
-            sleep_time = max(0.01, self.interval - t_elapsed)
-            time.sleep(sleep_time)
+            sleep_time = max(0.01, poll_interval - t_elapsed)
+            self._stop_event.wait(sleep_time)
 
     def start(self):
         """启动同步服务 (非阻塞)"""

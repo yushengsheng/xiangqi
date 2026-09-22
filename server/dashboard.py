@@ -45,7 +45,7 @@ svg{display:block;width:100%;height:100%}
     </div>
   </div>
   <div class="row">
-    <div class="setting"><label for="ai-level">AI 强度</label><select id="ai-level"><option value="normal">普通</option><option value="advanced">进阶</option><option value="expert">高级</option></select></div>
+    <div class="setting"><label for="ai-level">AI 强度</label><select id="ai-level"><option value="eco">节能</option><option value="normal">普通</option><option value="advanced">进阶</option><option value="expert">高级</option></select></div>
     <span class="meta">选择后立即生效</span>
   </div>
 </section>
@@ -125,7 +125,7 @@ function renderDock(){
   undoBtn.disabled=!ai.play_mode||!ai.can_undo;
   undoBtn.title=ai.variation_count?`已保存 ${ai.variation_count} 条变招分支`:'';
   if(document.activeElement!==levelInput){
-    levelInput.value=(ai.time_ms>=8000&&ai.engine_threads>=6)?'expert':((ai.time_ms>=3000&&ai.engine_threads>=4)?'advanced':'normal');
+    levelInput.value=(ai.time_ms>=8000&&ai.engine_threads>=6)?'expert':((ai.time_ms>=3000&&ai.engine_threads>=4)?'advanced':((ai.time_ms>=1000&&ai.engine_threads>=2)?'normal':'eco'));
   }
 }
 
@@ -204,6 +204,7 @@ document.getElementById('btn-undo').onclick=async()=>{
 };
 document.getElementById('ai-level').onchange=async ev=>{
   const presets={
+    eco:{time_ms:700,max_depth:60,engine_threads:1,engine_hash_mb:32},
     normal:{time_ms:1000,max_depth:60,engine_threads:2,engine_hash_mb:64},
     advanced:{time_ms:3000,max_depth:80,engine_threads:4,engine_hash_mb:128},
     expert:{time_ms:8000,max_depth:100,engine_threads:6,engine_hash_mb:256}
