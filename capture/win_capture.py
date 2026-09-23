@@ -5,6 +5,7 @@ Windows 指定窗口捕获器 (Windows Window-Specific Capture)
 """
 
 import sys
+import threading
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 from capture.base import BaseCapture
@@ -24,6 +25,14 @@ class WinCapture(BaseCapture):
         self.game_id = "unknown"
         self.game_name = "未识别"
         self.sct = None
+        self.last_error: Optional[str] = None
+        self.capture_source = "unavailable"
+        self._graphics_capture = None
+        self._graphics_control = None
+        self._graphics_hwnd: Optional[int] = None
+        self._graphics_frame: Optional[np.ndarray] = None
+        self._graphics_lock = threading.Lock()
+        self._graphics_ready = threading.Event()
         
         if sys.platform == "win32":
             self._init_win32()
@@ -80,7 +89,7 @@ class WinCapture(BaseCapture):
 
     def _update_game(self, title: str) -> None:
         lowered = title.lower()
-        if "天天象棋" in lowered:
+        if any(keyword in lowered for keyword in ("天天象棋", "应用宝", "腾讯手游助手")):
             self.game_id, self.game_name = "tiantian", "天天象棋"
         elif "jj象棋" in lowered or "jj 象棋" in lowered:
             self.game_id, self.game_name = "jj", "JJ象棋"
@@ -91,6 +100,7 @@ class WinCapture(BaseCapture):
             return None
 
         import ctypes
+        from ctypes import wintypes
         user32 = ctypes.windll.user32
 
         # 1. 若指定了 HWND；客户端重启后旧句柄失效，再按标题自动重找。
@@ -100,7 +110,16 @@ class WinCapture(BaseCapture):
                 length = user32.GetWindowTextLengthW(self.hwnd)
                 buff = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(self.hwnd, buff, length + 1)
-                self.window_info["title"] = buff.value.strip()
+                rect = wintypes.RECT()
+                user32.GetWindowRect(self.hwnd, ctypes.byref(rect))
+                self.window_info = {
+                    "id": self.hwnd,
+                    "title": buff.value.strip(),
+                    "rect": (
+                        rect.left, rect.top,
+                        rect.right - rect.left, rect.bottom - rect.top,
+                    ),
+                }
                 self._update_game(self.window_info["title"])
                 return self.hwnd
             self.target_hwnd = None
@@ -126,6 +145,70 @@ class WinCapture(BaseCapture):
                     return self.hwnd
 
         return None
+
+    def _stop_graphics_capture(self) -> None:
+        control = self._graphics_control
+        self._graphics_control = None
+        self._graphics_capture = None
+        self._graphics_hwnd = None
+        self._graphics_ready.clear()
+        with self._graphics_lock:
+            self._graphics_frame = None
+        if control is not None:
+            try:
+                control.stop()
+            except Exception:
+                pass
+
+    def capture_via_graphics(self, hwnd: int) -> Optional[np.ndarray]:
+        """Capture the window's compositor surface, independent of occlusion."""
+        try:
+            if self._graphics_control is not None and self._graphics_hwnd != hwnd:
+                self._stop_graphics_capture()
+
+            if self._graphics_control is None:
+                from windows_capture import WindowsCapture
+
+                self._graphics_ready.clear()
+                capture = WindowsCapture(
+                    window_hwnd=int(hwnd),
+                    cursor_capture=False,
+                    draw_border=False,
+                    # 只保留最新合成帧；10 FPS 足以覆盖快速双帧确认，
+                    # 同时避免后台无意义地复制 1080p 图像拖慢模拟器界面。
+                    minimum_update_interval=100,
+                )
+
+                def on_frame_arrived(frame, _control):
+                    image = frame.frame_buffer[:, :, :3].copy()
+                    with self._graphics_lock:
+                        self._graphics_frame = image
+                    self._graphics_ready.set()
+
+                def on_closed():
+                    self.last_error = "目标窗口已关闭，等待重新连接"
+                    self._graphics_ready.set()
+
+                capture.frame_handler = on_frame_arrived
+                capture.closed_handler = on_closed
+                self._graphics_capture = capture
+                self._graphics_hwnd = hwnd
+                self._graphics_control = capture.start_free_threaded()
+
+            if not self._graphics_ready.wait(timeout=2.0):
+                self.last_error = "Windows Graphics Capture 等待首帧超时"
+                return None
+            with self._graphics_lock:
+                frame = self._graphics_frame
+            if frame is None:
+                return None
+            self.capture_source = "windows_graphics_capture"
+            self.last_error = None
+            return frame.copy()
+        except Exception as exc:
+            self.last_error = f"Windows Graphics Capture 不可用: {exc}"
+            self._stop_graphics_capture()
+            return None
 
     def capture_via_printwindow(self, hwnd: int) -> Optional[np.ndarray]:
         """
@@ -249,13 +332,31 @@ class WinCapture(BaseCapture):
         if self.hwnd is None:
             return None
 
-        # 优先使用 PrintWindow 独立截取指定窗口
-        img = self.capture_via_printwindow(self.hwnd)
+        # 优先从窗口的图形合成表面取帧，遮挡窗口不会进入画面。
+        img = self.capture_via_graphics(self.hwnd)
         if img is not None:
             return img
 
+        # 兼容不支持 Graphics Capture 的旧系统/窗口。
+        img = self.capture_via_printwindow(self.hwnd)
+        if img is not None:
+            self.capture_source = "printwindow"
+            return img
+
         # 回退到精确窗口区域截图
-        return self.capture_via_rect(self.hwnd)
+        img = self.capture_via_rect(self.hwnd)
+        if img is not None:
+            self.capture_source = "screen_rect_fallback"
+        return img
+
+    def close(self) -> None:
+        self._stop_graphics_capture()
+        if self.sct is not None:
+            try:
+                self.sct.close()
+            except Exception:
+                pass
+            self.sct = None
 
     def is_available(self) -> bool:
         if sys.platform != "win32":
@@ -270,5 +371,6 @@ class WinCapture(BaseCapture):
             "rect": self.window_info.get("rect"),
             "game_id": self.game_id,
             "game_name": self.game_name,
-            "source": "printwindow",
+            "source": self.capture_source,
+            "last_error": self.last_error,
         }

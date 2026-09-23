@@ -37,7 +37,10 @@ from core.xiangqi import (
 )
 from core.engine import XiangqiEngine
 from core.ai_advisor import AIAdvisor
-from core.pikafish_engine import PikafishEngine, rotate_board_180
+from core.pikafish_engine import (
+    PIKAFISH_BINARY_SHA256, PIKAFISH_NNUE_SHA256,
+    PikafishEngine, rotate_board_180,
+)
 from capture.mock_capture import MockCapture
 from capture.mac_capture import MacCapture
 from capture.factory import create_capture, list_available_windows
@@ -322,6 +325,9 @@ def test_debouncer_and_moves():
     assert session_debouncer.session_revision == 2
 
     another_game = "3k5/6R1C/3c5/6n2/6b2/9/9/9/2r1p1p2/4K4 w - - 0 1"
+    for _ in range(3):
+        session_debouncer.update(empty_fen)
+        time.sleep(0.01)
     reopen_event = None
     for _ in range(5):
         reopen_event = session_debouncer.update(another_game) or reopen_event
@@ -404,8 +410,9 @@ def test_port_fallback_with_occupied_defaults():
         # 模拟 Shadowrocket 或其他本地代理已监听默认服务端口。
         for port in (8765, 8766):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
+                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
                 sock.bind(("127.0.0.1", port))
                 sock.listen(1)
                 blockers.append(sock)
@@ -433,8 +440,14 @@ def test_port_fallback_with_occupied_defaults():
 
             state = {}
             for _ in range(30):
-                with urllib.request.urlopen(runtime["http_url"] + "/status", timeout=2.0) as response:
-                    state = json.loads(response.read().decode("utf-8"))
+                try:
+                    with urllib.request.urlopen(runtime["http_url"] + "/status", timeout=2.0) as response:
+                        state = json.loads(response.read().decode("utf-8"))
+                except (urllib.error.URLError, ConnectionError, TimeoutError):
+                    # Windows 上 HTTP 线程刚绑定端口时，第一次连接可能被
+                    # 系统重置；这不代表端口避让或服务启动失败。
+                    time.sleep(0.1)
+                    continue
                 if state.get("piece_count") == 10:
                     break
                 time.sleep(0.1)
@@ -593,12 +606,35 @@ def test_sync_server_end_to_end():
             html_body = resp.read().decode("utf-8")
             assert "象棋盘面同步" in html_body
             assert "楚 河" in html_body and "最新 FEN" not in html_body
-            assert "AI 执下方" in html_body and "回退一步" in html_body
-            assert "AI 强度" in html_body and "选择后立即生效" in html_body
+            assert "AI 执下方" in html_body and "实时只读 · 自动跟随实盘" in html_body
+            assert "棋盘模拟" not in html_body and "回退一步" not in html_body
+            assert "AI 强度" in html_body and "清理缓存并重新读取对局" in html_body
+            assert "/api/live/reset" in html_body
             assert "节能" in html_body and "普通" in html_body and "进阶" in html_body and "高级" in html_body
             assert "Pikafish" in html_body
 
-        # 4. AI 回退接口存在并返回结构化状态。
+        # 4. 手动恢复接口会先清空展示，再由捕获线程完整重建盘面。
+        reset_request = urllib.request.Request(
+            f"http://127.0.0.1:{http_port}/api/live/reset",
+            data=b"{}", headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(reset_request, timeout=2.0) as resp:
+            reset_state = json.loads(resp.read().decode("utf-8"))
+            assert reset_state["event_type"] == "reset_requested"
+            assert reset_state["capture_status"] == "resetting"
+            assert reset_state["piece_count"] == 10
+            assert reset_state["board"], "后台重读期间必须保留当前稳定盘面"
+        for _ in range(40):
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{http_port}/api/status", timeout=2.0
+            ) as resp:
+                recovered_state = json.loads(resp.read().decode("utf-8"))
+            if recovered_state.get("piece_count") == 10:
+                break
+            time.sleep(0.05)
+        assert recovered_state.get("piece_count") == 10
+
+        # 5. AI 回退接口存在并返回结构化状态。
         undo_request = urllib.request.Request(
             f"http://127.0.0.1:{http_port}/api/ai/undo",
             data=b"{}", headers={"Content-Type": "application/json"}, method="POST"
@@ -634,6 +670,16 @@ def test_sync_server_end_to_end():
         try:
             urllib.request.urlopen(bad_config, timeout=2.0)
             raise AssertionError("非法 AI 参数应返回 HTTP 400")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+        builtin_config = urllib.request.Request(
+            f"http://127.0.0.1:{http_port}/api/ai/config",
+            data=b'{"engine_kind":"builtin"}',
+            headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            urllib.request.urlopen(builtin_config, timeout=2.0)
+            raise AssertionError("发布接口不应允许切换到内置 AI")
         except urllib.error.HTTPError as exc:
             assert exc.code == 400
         hostile = urllib.request.Request(
@@ -786,8 +832,8 @@ def test_xiangqi_engine_and_bottom_ai():
             for block in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(block)
         return digest.hexdigest()
-    assert sha256(pika.binary_path) == "3a11f9034ef723bb4068e4cf88a79a12d99507474ba118fa916ec2cecd4f4abe"
-    assert sha256(pika.nnue_path) == "7d13d73569a9b571ba0eb20cf1596247bc2a42738967e61afef6482b231e900e"
+    assert sha256(pika.binary_path) == PIKAFISH_BINARY_SHA256
+    assert sha256(pika.nnue_path) == PIKAFISH_NNUE_SHA256
     pika_red = pika.search(start_board, "r", time_ms=120, max_depth=60)
     assert pika_red.engine == "pikafish" and pika_red.move is not None
     assert is_legal_move(start_board, pika_red.move, "r")
@@ -820,7 +866,10 @@ def test_xiangqi_engine_and_bottom_ai():
     pika.close()
 
     # 主引擎缺失时必须自动回退，不能让整套 AI 停摆。
-    fallback = AIAdvisor(time_ms=80, max_depth=2, enabled=True, engine_kind="pikafish")
+    fallback = AIAdvisor(
+        time_ms=80, max_depth=2, enabled=True, engine_kind="pikafish",
+        allow_builtin_fallback=True,
+    )
     fallback.pikafish.binary_path = Path("/definitely/missing/pikafish")
     fallback.on_live_position(start_board, "r", session_revision=1)
     for _ in range(60):
@@ -832,6 +881,23 @@ def test_xiangqi_engine_and_bottom_ai():
     assert fallback_state["engine_error"], fallback_state
     fallback.stop()
     print("  ✓ 回合/变招连续应手、Pikafish红黑翻面、停止搜索与故障回退全部通过")
+
+
+def test_windows_launcher_structure():
+    print("[Launcher Windows] 验证无黑框启动器与 Pikafish 固定配置...")
+    vbs_path = "启动象棋同步.vbs"
+    cmd_path = "start_windows.cmd"
+    assert os.path.isfile(vbs_path) and os.path.isfile(cmd_path)
+    with open(vbs_path, encoding="utf-8") as handle:
+        vbs = handle.read()
+    with open(cmd_path, encoding="utf-8") as handle:
+        cmd = handle.read()
+    assert "shell.Run command, 0, False" in vbs
+    assert "/api/ai/follow" in vbs and "OpenDashboard url" in vbs
+    assert "--ai-engine pikafish" in cmd and "--ai-engine builtin" not in cmd
+    assert all(line.strip().lower() != "pause" for line in cmd.splitlines())
+    assert PikafishEngine().is_available()
+    print("  ✓ VBS 隐藏启动、自动跟随实盘、自动打开网页并固定使用 Pikafish")
 
 
 def run_all():
@@ -852,16 +918,19 @@ def run_all():
     test_session_reset_websocket()
     run_recovery_tests()
     
-    # 启动器与 .app 生命周期测试
-    print("\n--- 启动器与 .app 自动化测试 ---")
-    test_app_bundle_structure()
-    test_cold_start_and_service()
-    test_runtime_communication()
-    test_clean_stop()
+    if sys.platform == "darwin":
+        print("\n--- 启动器与 .app 自动化测试 ---")
+        test_app_bundle_structure()
+        test_cold_start_and_service()
+        test_runtime_communication()
+        test_clean_stop()
+    elif sys.platform == "win32":
+        print("\n--- Windows 无黑框启动器自动化测试 ---")
+        test_windows_launcher_structure()
 
     t1 = time.perf_counter()
     print("=" * 65)
-    print(f"🎉 全部 14 项核心功能与启动器、17 项追帧与捕获恢复专项回归测试 100% 通过！(总耗时: {t1-t0:.2f}s)")
+    print(f"🎉 核心功能、平台启动器与追帧/捕获恢复回归测试 100% 通过！(总耗时: {t1-t0:.2f}s)")
     print("=" * 65)
 
 

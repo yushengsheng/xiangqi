@@ -35,7 +35,11 @@ class PikafishError(RuntimeError):
     pass
 
 
-PIKAFISH_BINARY_SHA256 = "3a11f9034ef723bb4068e4cf88a79a12d99507474ba118fa916ec2cecd4f4abe"
+PIKAFISH_BINARY_SHA256 = (
+    "0d57d64c212e78f96cba9e5e4f140d8872f8faa42ea631a27ab6c5db08509da3"
+    if os.name == "nt"
+    else "3a11f9034ef723bb4068e4cf88a79a12d99507474ba118fa916ec2cecd4f4abe"
+)
 PIKAFISH_NNUE_SHA256 = "7d13d73569a9b571ba0eb20cf1596247bc2a42738967e61afef6482b231e900e"
 
 
@@ -60,7 +64,8 @@ class PikafishEngine:
                  threads: int = 2, hash_mb: int = 64) -> None:
         root = Path(__file__).resolve().parent.parent
         engine_dir = root / "engines" / "pikafish"
-        self.binary_path = Path(binary_path) if binary_path else engine_dir / "pikafish"
+        default_binary = "pikafish.exe" if os.name == "nt" else "pikafish"
+        self.binary_path = Path(binary_path) if binary_path else engine_dir / default_binary
         self.nnue_path = Path(nnue_path) if nnue_path else engine_dir / "pikafish.nnue"
         self.threads = max(1, min(32, int(threads)))
         self.hash_mb = max(16, min(2048, int(hash_mb)))
@@ -208,6 +213,8 @@ class PikafishEngine:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
                 )
             except OSError as exc:
@@ -229,7 +236,15 @@ class PikafishEngine:
     def _apply_options(self) -> None:
         if not self._options_dirty:
             return
-        self._send(f"setoption name EvalFile value {self.nnue_path.resolve()}")
+        # The engine starts in its own directory, so prefer an ASCII relative
+        # filename.  This avoids Windows pipe/code-page ambiguity when the
+        # project lives under a non-ASCII path such as “象棋”.
+        eval_path = self.nnue_path.resolve()
+        try:
+            eval_value = str(eval_path.relative_to(self.binary_path.parent.resolve()))
+        except ValueError:
+            eval_value = str(eval_path)
+        self._send(f"setoption name EvalFile value {eval_value}")
         self._send(f"setoption name Threads value {self.threads}")
         self._send(f"setoption name Hash value {self.hash_mb}")
         self._send("setoption name MultiPV value 1")

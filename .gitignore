@@ -1,4 +1,5 @@
 .DS_Store
+.playwright-cli/
 __pycache__/
 *.py[cod]
 logs/
@@ -15,3 +16,5 @@ dist/
 /test_images/tiantian_battle_desktop.png
 /test_images/tiantian_battle_live_now.png
 /test_images/tiantian_battle_red_top.png
+/test_images/tiantian_cache_lag_regression.png
+/test_images/tiantian_chat_recovery_regression.png

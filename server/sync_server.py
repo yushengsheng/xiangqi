@@ -147,30 +147,35 @@ class SyncHTTPServer(http.server.ThreadingHTTPServer):
 
 
 class SyncHTTPHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send_bytes(self, payload: bytes, content_type: str,
+                    status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.end_headers()
+        if payload:
+            self.wfile.write(payload)
+
     def do_GET(self):
         sync = self.server.sync_server
         state = sync.get_latest_state()
 
         if self.path == "/" or self.path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
             dashboard = WEB_DASHBOARD_HTML.replace("__WS_PORT__", str(sync.ws_port))
-            self.wfile.write(dashboard.encode("utf-8"))
+            self._send_bytes(dashboard.encode("utf-8"), "text/html; charset=utf-8")
             return
 
         if self.path == "/fen":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(state.get("fen", "").encode("utf-8"))
+            self._send_bytes(
+                state.get("fen", "").encode("utf-8"), "text/plain; charset=utf-8",
+            )
             return
 
         if self.path == "/status" or self.path == "/api/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(state, ensure_ascii=False).encode("utf-8"))
+            self._send_json(state)
             return
 
         if self.path == "/move" or self.path == "/api/move":
@@ -181,8 +186,7 @@ class SyncHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(state.get("ai") or {})
             return
 
-        self.send_response(404)
-        self.end_headers()
+        self._send_bytes(b"", "text/plain; charset=utf-8", 404)
 
     def _origin_allowed(self) -> bool:
         origin = self.headers.get("Origin")
@@ -198,6 +202,7 @@ class SyncHTTPHandler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         if not self._origin_allowed():
             self.send_response(403)
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
         self.send_response(204)
@@ -207,6 +212,7 @@ class SyncHTTPHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_POST(self):
@@ -226,6 +232,10 @@ class SyncHTTPHandler(http.server.BaseHTTPRequestHandler):
 
         advisor = sync.advisor
         if path == "/api/ai/config":
+            requested_engine = body.get("engine_kind")
+            if requested_engine not in (None, "pikafish"):
+                self._send_json({"error": "当前版本仅支持 Pikafish，不会启用内置 AI"}, 400)
+                return
             try:
                 advisor.configure(
                     enabled=body.get("enabled"),
@@ -244,6 +254,9 @@ class SyncHTTPHandler(http.server.BaseHTTPRequestHandler):
             advisor.start_local_game()
         elif path == "/api/ai/follow":
             advisor.follow_live()
+        elif path == "/api/live/reset":
+            self._send_json(sync.request_live_reset())
+            return
         elif path == "/api/ai/turn":
             side = body.get("side")
             if side in ("r", "b"):
@@ -259,21 +272,23 @@ class SyncHTTPHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, 400)
                 return
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send_bytes(b"", "text/plain; charset=utf-8", 404)
             return
 
         self._send_json(sync.publish_ai())
 
     def _send_json(self, payload, status=200):
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
         origin = self.headers.get("Origin")
         if origin and self._origin_allowed():
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.end_headers()
-        self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        self.wfile.write(encoded)
 
     def log_message(self, format, *args):
         # 静默常规请求日志，避免刷屏
@@ -296,6 +311,7 @@ class SyncServer:
                  ai_engine: str = "pikafish",
                  ai_threads: int = 1,
                  ai_hash_mb: int = 32,
+                 ai_allow_builtin_fallback: bool = False,
                  ai_settings_path: Optional[str] = None):
         self.capture = capture
         self.recognizer = recognizer or BoardRecognizer()
@@ -320,6 +336,13 @@ class SyncServer:
         self._idle_thread: Optional[threading.Thread] = None
         self._last_client_seen = time.monotonic()
         self._active_game_id = "unknown"
+        self._reset_requested = threading.Event()
+        self._manual_reset_active = False
+        self._manual_reset_deadline = 0.0
+        self._manual_reset_timeout = 2.5
+        self._pending_since = 0.0
+        self._last_tracking_refresh = 0.0
+        self._consecutive_pipeline_errors = 0
 
         # 线程安全共享状态
         self._lock = threading.Lock()
@@ -336,6 +359,7 @@ class SyncServer:
             "session_revision": 0,
             "last_frame_at": 0.0,
             "capture_info": self.capture.get_info(),
+            "manual_reset_pending": False,
             "ai": None,
         }
         self.advisor = AIAdvisor(
@@ -345,6 +369,7 @@ class SyncServer:
             engine_kind=ai_engine,
             engine_threads=ai_threads,
             engine_hash_mb=ai_hash_mb,
+            allow_builtin_fallback=ai_allow_builtin_fallback,
             on_update=self._on_ai_update,
         )
         self._latest_state["ai"] = self.advisor.snapshot()
@@ -370,6 +395,8 @@ class SyncServer:
             return max(self.interval, 0.75)
         if source == "coregraphics" and has_stable_board:
             return max(self.interval, 0.30)
+        if source == "windows_graphics_capture" and has_stable_board:
+            return max(self.interval, 0.25)
         return self.interval
 
     @staticmethod
@@ -445,6 +472,50 @@ class SyncServer:
         payload["event_type"] = "ai_update"
         self._broadcast_event(payload)
         return payload
+
+    def request_live_reset(self) -> Dict[str, Any]:
+        """由捕获线程安全地清空识别状态，并立即向界面反馈。"""
+        self._manual_reset_active = True
+        self._manual_reset_deadline = time.monotonic() + self._manual_reset_timeout
+        self._reset_requested.set()
+        self.advisor.follow_live()
+        now = time.time()
+        self._update_state({
+            "raw_piece_count": 0,
+            "last_move": None,
+            "timestamp": now,
+            "recognition_pending": True,
+            "recognition_rejection": "正在后台重新读取当前对局",
+            "capture_status": "resetting",
+            "manual_reset_pending": True,
+            "description": "正在后台重新读取当前对局，旧盘面会保留到新盘面就绪",
+        })
+        payload = self.get_latest_state()
+        payload["event_type"] = "reset_requested"
+        self._broadcast_event(payload)
+        return payload
+
+    def _expire_manual_reset(self) -> None:
+        """有界结束重读；无论捕获是否有帧都不能无限等待。"""
+        if not self._manual_reset_active:
+            return
+        self._reset_requested.clear()
+        cancel_reanchor = getattr(self.debouncer, "cancel_reanchor", None)
+        if cancel_reanchor:
+            cancel_reanchor()
+        self._manual_reset_active = False
+        self._manual_reset_deadline = 0.0
+        current = self.get_latest_state()
+        has_board = bool(current.get("board"))
+        self._update_state({
+            "manual_reset_pending": False,
+            "capture_status": "ok" if has_board else "waiting",
+            "description": (
+                "未获得新的完整帧，已继续使用当前稳定盘面"
+                if has_board else "等待棋盘画面恢复"
+            ),
+            "timestamp": time.time(),
+        })
 
     def _on_ai_update(self) -> None:
         if not self.running:
@@ -549,9 +620,49 @@ class SyncServer:
         while not self._stop_event.is_set():
             t_start = time.perf_counter()
             poll_interval = self.interval
-            frame = self.capture.capture()
+            if (
+                self._manual_reset_active
+                and self._manual_reset_deadline > 0
+                and time.monotonic() >= self._manual_reset_deadline
+            ):
+                self._expire_manual_reset()
+            try:
+                frame = self.capture.capture()
+            except Exception as exc:
+                # 取窗驱动、WGC 或模拟器偶发重建表面时，单帧异常不能杀死
+                # 整个后台线程。保留最后稳定盘面，下轮重新尝试捕获。
+                self._consecutive_pipeline_errors += 1
+                try:
+                    capture_info = self.capture.get_info()
+                except Exception:
+                    capture_info = {"mode": "unknown"}
+                poll_interval = self._effective_poll_interval(capture_info)
+                self._update_state({
+                    "capture_status": "error",
+                    "recognition_pending": True,
+                    "recognition_rejection": "画面通道短暂异常，正在自动重新连接",
+                    "manual_reset_pending": self._manual_reset_active,
+                    "capture_info": capture_info,
+                    "poll_interval": poll_interval,
+                    "description": "画面通道短暂异常，已保留当前盘面并自动重试",
+                    "timestamp": time.time(),
+                })
+                print(f"[SyncServer] Capture error: {exc}")
+                elapsed = time.perf_counter() - t_start
+                self._stop_event.wait(max(0.01, poll_interval - elapsed))
+                continue
             if frame is not None:
                 try:
+                    if self._reset_requested.is_set():
+                        self._reset_requested.clear()
+                        request_reanchor = getattr(self.debouncer, "request_reanchor", None)
+                        if request_reanchor:
+                            request_reanchor()
+                        else:
+                            self.debouncer.reset()
+                        reset_tracking = getattr(self.recognizer, "reset_tracking", None)
+                        if reset_tracking:
+                            reset_tracking()
                     capture_info = self.capture.get_info()
                     game_id = capture_info.get("game_id", "unknown")
                     set_capture_source = getattr(self.recognizer, "set_capture_source", None)
@@ -575,11 +686,67 @@ class SyncServer:
                             pieces.count("r_k") == 1 and pieces.count("b_k") == 1,
                         )
 
-                    # 送入防抖状态机。看板只使用已确认盘面，绝不显示选中动画的瞬时丢子。
-                    event = self.debouncer.update(
-                        raw_fen, rec_result["board"], rec_result.get("last_move_side")
+                    # 送入防抖状态机。即使当前整盘字形校验暂时失败，只要已有
+                    # 稳定锚点和 90 格占位信息，仍允许状态机从“来源空、目标被
+                    # 同色棋子占据”推断唯一合法走子。将/帅落点光圈正是此类帧。
+                    occupancy = rec_result.get("occupancy")
+                    can_reconcile_degraded = (
+                        self.debouncer.last_stable_board is not None
+                        and isinstance(occupancy, list)
+                        and len(occupancy) == 10
+                        and all(isinstance(row, list) and len(row) == 9 for row in occupancy)
                     )
+                    recognition_valid = rec_result.get("recognition_valid", True)
+                    occupied_count = rec_result.get("occupied_count")
+                    manual_candidate_complete = (
+                        recognition_valid
+                        and (
+                            occupied_count is None
+                            or occupied_count == raw_piece_count
+                        )
+                    )
+                    # 清缓存重读期间只允许完整字形帧接管锚点。正常走子仍可
+                    # 用占位图恢复被光圈遮住的目标棋子，但这个宽松通道不能
+                    # 用于整盘重建，否则一个动画帧就会永久丢子或留下旧子。
+                    if self._manual_reset_active:
+                        accept_observation = manual_candidate_complete
+                    else:
+                        accept_observation = recognition_valid or can_reconcile_degraded
+                    if accept_observation:
+                        event = self.debouncer.update(
+                            raw_fen,
+                            rec_result["board"],
+                            rec_result.get("last_move_side"),
+                            occupancy,
+                            rec_result.get("occupied_sides"),
+                            rec_result.get("last_visual_move"),
+                        )
+                    else:
+                        event = None
+                        note_unstable = getattr(self.debouncer, "note_unstable_source", None)
+                        if note_unstable:
+                            note_unstable(raw_piece_count)
+                        if self._manual_reset_active:
+                            self.debouncer.last_rejection_reason = (
+                                "正在等待连续完整盘面，当前动画帧不会覆盖旧盘面"
+                            )
+                        elif self.debouncer.last_stable_board is None:
+                            self.debouncer.last_rejection_reason = (
+                                "正在等待聊天/弹窗关闭或棋盘画面稳定，旧盘面会暂时保留"
+                            )
+                        else:
+                            self.debouncer.last_rejection_reason = (
+                                "棋盘暂时被动画、聊天或弹窗遮挡，已保留上一盘面并自动重试"
+                            )
                     stable_fen, stable_board = self.debouncer.get_stable_state()
+                    if self._manual_reset_active:
+                        if event and event.get("event_type") in {
+                            "manual_reanchor", "initial", "session_reset",
+                        }:
+                            self._manual_reset_active = False
+                            self._manual_reset_deadline = 0.0
+                        elif time.monotonic() >= self._manual_reset_deadline:
+                            self._expire_manual_reset()
                     if stable_fen is None or stable_board is None:
                         poll_interval = self._effective_poll_interval(
                             capture_info, has_stable_board=False, recognition_pending=False,
@@ -588,10 +755,15 @@ class SyncServer:
                             "raw_piece_count": raw_piece_count,
                             "recognition_pending": True,
                             "capture_status": "waiting",
+                            "manual_reset_pending": self._manual_reset_active,
                             "description": self.debouncer.last_rejection_reason or "等待进入有效棋局",
+                            "recognition_rejection": (
+                                self.debouncer.last_rejection_reason or "等待进入有效棋局"
+                            ),
                             "capture_info": capture_info,
                             "game_id": rec_result.get("game_id", game_id),
                             "game_name": rec_result.get("game_name", capture_info.get("game_name", "象棋")),
+                            "grid_source": rec_result.get("grid_source"),
                             "frame_resolution": f"{frame.shape[1]}x{frame.shape[0]}",
                             "poll_interval": poll_interval,
                         })
@@ -608,13 +780,25 @@ class SyncServer:
                     fps = len(frame_times) / 2.0 if len(frame_times) > 1 else 1.0 / self.interval
 
                     recognition_pending = rec_result["board"] != stable_board
-                    fast_confirmation = self._looks_like_single_move(
-                        stable_board, rec_result["board"]
-                    )
+                    now_monotonic = time.monotonic()
+                    if recognition_pending:
+                        if self._pending_since <= 0:
+                            self._pending_since = now_monotonic
+                        elif (
+                            now_monotonic - self._pending_since >= 1.5
+                            and now_monotonic - self._last_tracking_refresh >= 2.0
+                            and not self._manual_reset_active
+                        ):
+                            refresh_tracking = getattr(self.recognizer, "reset_tracking", None)
+                            if refresh_tracking:
+                                refresh_tracking()
+                            self._last_tracking_refresh = now_monotonic
+                    else:
+                        self._pending_since = 0.0
                     poll_interval = self._effective_poll_interval(
                         capture_info,
                         has_stable_board=True,
-                        recognition_pending=fast_confirmation,
+                        recognition_pending=recognition_pending,
                     )
 
                     state_update = {
@@ -630,13 +814,15 @@ class SyncServer:
                         "session_revision": self.debouncer.session_revision,
                         "timestamp": now,
                         "fps": round(fps, 1),
-                        "capture_status": "ok",
+                        "capture_status": "resetting" if self._manual_reset_active else "ok",
+                        "manual_reset_pending": self._manual_reset_active,
                         "last_frame_at": now,
                         "frame_resolution": f"{frame.shape[1]}x{frame.shape[0]}",
                         "capture_info": capture_info,
                         "poll_interval": poll_interval,
                         "game_id": rec_result.get("game_id", self._active_game_id),
                         "game_name": rec_result.get("game_name", capture_info.get("game_name", "象棋")),
+                        "grid_source": rec_result.get("grid_source"),
                         "side_to_move": self.debouncer.active_side,
                     }
                     self.advisor.on_live_position(
@@ -660,14 +846,45 @@ class SyncServer:
                     else:
                         self._update_state(state_update)
 
+                    self._consecutive_pipeline_errors = 0
+
                 except Exception as e:
+                    # 识别器内部任何一次异常都只影响当前帧。清理视觉跟踪缓存，
+                    # 下一帧从当前画面重建；已确认盘面始终保留。
+                    self._consecutive_pipeline_errors += 1
+                    reset_tracking = getattr(self.recognizer, "reset_tracking", None)
+                    if reset_tracking:
+                        try:
+                            reset_tracking()
+                        except Exception:
+                            pass
+                    self._pending_since = 0.0
+                    try:
+                        capture_info = self.capture.get_info()
+                    except Exception:
+                        capture_info = {"mode": "unknown"}
+                    poll_interval = self._effective_poll_interval(capture_info)
+                    self._update_state({
+                        "capture_status": "error",
+                        "recognition_pending": True,
+                        "recognition_rejection": "识别遇到临时异常，正在自动重建",
+                        "manual_reset_pending": self._manual_reset_active,
+                        "capture_info": capture_info,
+                        "poll_interval": poll_interval,
+                        "description": "识别遇到临时异常，已保留当前盘面并自动恢复",
+                        "timestamp": time.time(),
+                    })
                     print(f"[SyncServer] Recognition error: {e}")
             else:
-                capture_info = self.capture.get_info()
+                try:
+                    capture_info = self.capture.get_info()
+                except Exception as exc:
+                    capture_info = {"mode": "unknown", "last_error": str(exc)}
                 poll_interval = self._effective_poll_interval(capture_info)
                 capture_error = capture_info.get("last_error")
                 self._update_state({
                     "capture_status": "error",
+                    "manual_reset_pending": self._manual_reset_active,
                     "capture_info": capture_info,
                     "poll_interval": poll_interval,
                     "description": capture_error or "未获取到画面帧（窗口可能已关闭、最小化或权限受限）"
@@ -700,16 +917,16 @@ class SyncServer:
         self._idle_thread.start()
 
         print(f"[SyncServer] 同步服务已启动:")
-        print(f"  • WebSocket 实时流: ws://{self.host}:{self.ws_port}")
-        print(f"  • HTTP 接口/Web看板: http://{self.host}:{self.http_port}/")
-        print(f"  • 纯文本 FEN 获取:   http://{self.host}:{self.http_port}/fen")
+        print(f"  - WebSocket 实时流: ws://{self.host}:{self.ws_port}")
+        print(f"  - HTTP 接口/Web看板: http://{self.host}:{self.http_port}/")
+        print(f"  - 纯文本 FEN 获取:   http://{self.host}:{self.http_port}/fen")
         print(
-            f"  • AI 执画面下方（{'开' if self.advisor.enabled else '关'}，"
+            f"  - AI 执画面下方（{'开' if self.advisor.enabled else '关'}，"
             f"{self.advisor.engine_kind}，{self.advisor.time_ms}ms / 深度 {self.advisor.max_depth}，"
             f"{self.advisor.engine_threads}线程 / {self.advisor.engine_hash_mb}MB Hash）"
         )
         if self.idle_timeout > 0:
-            print(f"  • 看板关闭 {self.idle_timeout:g}s 后自动停止（--idle-timeout 0 可关闭）")
+            print(f"  - 看板关闭 {self.idle_timeout:g}s 后自动停止（--idle-timeout 0 可关闭）")
 
     def stop(self):
         """停止同步服务"""
@@ -718,6 +935,12 @@ class SyncServer:
         self.running = False
         self._stop_event.set()
         self.advisor.stop()
+        close_capture = getattr(self.capture, "close", None)
+        if close_capture:
+            try:
+                close_capture()
+            except Exception:
+                pass
 
         if self._http_server:
             try:

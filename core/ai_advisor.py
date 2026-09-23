@@ -33,13 +33,15 @@ class AIAdvisor:
     def __init__(self, time_ms: int = 700, max_depth: int = 60,
                  enabled: bool = True, on_update: Optional[OnUpdate] = None,
                  engine_kind: str = "pikafish", engine_threads: int = 1,
-                 engine_hash_mb: int = 32):
+                 engine_hash_mb: int = 32,
+                 allow_builtin_fallback: bool = False):
         self.time_ms = time_ms
         self.max_depth = max_depth
         self.enabled = enabled
         self.engine_kind = engine_kind if engine_kind in ("pikafish", "builtin") else "pikafish"
         self.engine_threads = max(1, min(32, int(engine_threads)))
         self.engine_hash_mb = max(16, min(2048, int(engine_hash_mb)))
+        self.allow_builtin_fallback = bool(allow_builtin_fallback)
         self.active_engine = self.engine_kind
         self.engine_error: Optional[str] = None
         self.mode = "coach"  # coach | play
@@ -538,6 +540,8 @@ class AIAdvisor:
                     with self._lock:
                         if job_id != self._job_id:
                             return
+                    if not self.allow_builtin_fallback:
+                        raise RuntimeError(f"Pikafish 不可用：{fallback_error}")
                     engine = XiangqiEngine()
                     self._running_engine = engine
                     result = engine.search(

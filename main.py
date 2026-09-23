@@ -15,6 +15,23 @@ import argparse
 import json
 import os
 
+
+def _configure_windows_console() -> None:
+    """Keep Unicode status output usable in GBK-configured Windows consoles."""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+_configure_windows_console()
+
 import cv2
 from typing import Optional
 
@@ -25,6 +42,20 @@ from core.calibration_store import interactive_calibrate, load_normalized_corner
 from core.debouncer import BoardDebouncer
 from server.sync_server import SyncServer
 from server.ports import select_port_pair, write_runtime_info
+
+
+def write_image(path: str, frame) -> bool:
+    """Write an OpenCV image through Python so Unicode Windows paths work."""
+    extension = os.path.splitext(path)[1] or ".png"
+    encoded_ok, encoded = cv2.imencode(extension, frame)
+    if not encoded_ok:
+        return False
+    try:
+        with open(path, "wb") as output:
+            output.write(encoded.tobytes())
+        return True
+    except OSError:
+        return False
 
 
 def print_windows_table():
@@ -66,7 +97,7 @@ def main():
     parser.add_argument("--request-screen-permission", action="store_true", help="仅一次：请求 macOS 屏幕录制授权后退出")
     parser.add_argument("--no-ai", action="store_true", help="关闭 AI（默认使用本地 Pikafish，始终执画面下方）")
     parser.add_argument("--ai-settings-file", default="config/ai_settings.json", help="保存网页 AI 强度档位的配置文件")
-    parser.add_argument("--ai-engine", choices=["pikafish", "builtin"], default=None, help="覆盖已保存的 AI 引擎")
+    parser.add_argument("--ai-engine", choices=["pikafish"], default=None, help="使用本地 Pikafish AI")
     parser.add_argument("--ai-time", type=float, default=None, help="覆盖已保存的每步思考时间（秒）")
     parser.add_argument("--ai-depth", type=int, default=None, help="覆盖已保存的最大搜索深度")
     parser.add_argument("--ai-threads", type=int, default=None, help="覆盖已保存的 Pikafish CPU 线程数")
@@ -89,7 +120,8 @@ def main():
         except (TypeError, ValueError):
             return float(default)
 
-    ai_engine = args.ai_engine or saved_ai.get("engine_kind", "pikafish")
+    # 发布版只允许 Pikafish；忽略旧配置里可能残留的 builtin 值。
+    ai_engine = "pikafish"
     ai_time = args.ai_time if args.ai_time is not None else saved_number("time_ms", 700) / 1000.0
     ai_depth = args.ai_depth if args.ai_depth is not None else saved_number("max_depth", 60)
     ai_threads = args.ai_threads if args.ai_threads is not None else saved_number("engine_threads", 1)
@@ -167,7 +199,7 @@ def main():
         if args.capture_once:
             output_path = os.path.abspath(args.capture_once)
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            if not cv2.imwrite(output_path, frame):
+            if not write_image(output_path, frame):
                 print(f"[!] 无法写入抓帧文件: {output_path}")
                 sys.exit(3)
             print(f"[*] 实时窗口帧已保存: {output_path} ({frame.shape[1]}x{frame.shape[0]})")
@@ -198,9 +230,10 @@ def main():
         ai_enabled=not args.no_ai,
         ai_time_ms=int(max(0.08, min(30.0, float(ai_time))) * 1000),
         ai_max_depth=max(1, min(128, int(ai_depth))),
-        ai_engine=ai_engine if ai_engine in ("pikafish", "builtin") else "pikafish",
+        ai_engine=ai_engine,
         ai_threads=max(1, min(32, int(ai_threads))),
         ai_hash_mb=max(16, min(2048, int(ai_hash))),
+        ai_allow_builtin_fallback=False,
         ai_settings_path=args.ai_settings_file,
     )
 

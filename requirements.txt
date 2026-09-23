@@ -4,5 +4,4 @@ mss==10.2.0
 Pillow==12.3.0
 websockets==17.1
 pyobjc-framework-Quartz==12.2.2; sys_platform == "darwin"
-# Windows specific (install with pip install pywin32 on Windows)
-# pywin32; sys_platform == 'win32'
+windows-capture==2.0.1; sys_platform == "win32"
