@@ -53,6 +53,12 @@ from tests.test_launcher_app import (
     test_clean_stop
 )
 
+# The suite only contacts local test servers. Windows system proxies can send
+# loopback requests to an unrelated proxy and make every HTTP check fail.
+urllib.request.install_opener(
+    urllib.request.build_opener(urllib.request.ProxyHandler({}))
+)
+
 
 def test_fen_conversion():
     print("[Test 1/6] 正在回归 FEN 解析与双向转换...")
@@ -207,9 +213,7 @@ def test_debouncer_and_moves():
     print("[Test 4/6] 正在回归走子去抖、常规走法与吃子判定状态机...")
     debouncer = BoardDebouncer(required_stable_frames=2, min_stable_seconds=0.05)
     fen_init = "3k5/6R1C/3c5/6N2/6b2/9/9/9/2r1p1p2/5K3 w - - 0 1"
-    fen_move = "3k5/6R1C/3c5/6N2/6b2/9/9/9/2r1p1p2/4K4 b - - 1 1"
-    fen_pre_capture = "3k5/6R1C/3c5/6n2/6b2/9/9/9/2r1p1p2/4K4 b - - 1 1"
-    fen_capture = "3k5/8C/3c5/6R2/6b2/9/9/9/2r1p1p2/4K4 w - - 2 2"
+    fen_move = "3k5/8C/3c2R2/6N2/6b2/9/9/9/2r1p1p2/5K3 b - - 1 1"
 
     # 1. 初始帧
     ev1 = debouncer.update(fen_init)
@@ -267,41 +271,43 @@ def test_debouncer_and_moves():
     selected_move_event = selection_move.update(landed_fen, landed_board)
     assert selected_move_event and selected_move_event["move"]["uci"] == "i8i4"
 
-    # 若服务启动时棋子正被特效遮住，取消选中后应逐格补回。
+    # 中盘冷启动若恰逢遮挡，不允许后来出现的单格直接“补子”；只有用户
+    # 明确请求完整重读后，连续稳定盘面才能替换锚点。
     startup_recovery = BoardDebouncer(required_stable_frames=2, min_stable_seconds=0.01)
     startup_recovery.update(fen_missing_piece, animated_board)
-    recovered_event = None
     recovered_board = fen_to_matrix(fen_init)[0]
     for _ in range(5):
-        event = startup_recovery.update(fen_init, recovered_board)
-        recovered_event = event or recovered_event
+        assert startup_recovery.update(fen_init, recovered_board) is None
         time.sleep(0.01)
-    assert startup_recovery.last_stable_fen == fen_init
-    assert recovered_event is not None and recovered_event["event_type"] == "recovered"
+    assert startup_recovery.last_stable_fen == fen_missing_piece
+    startup_recovery.request_reanchor()
+    reset_event = None
+    for _ in range(4):
+        reset_event = startup_recovery.update(fen_init, recovered_board) or reset_event
+        time.sleep(0.01)
+    assert reset_event and reset_event["event_type"] == "manual_reanchor"
+    assert startup_recovery.last_stable_board == recovered_board
 
-    # 补回被遮挡棋子不能把当前行棋方错误重置成红方。
-    turn_recovery = BoardDebouncer(required_stable_frames=2, min_stable_seconds=0.0)
-    turn_recovery.update(fen_missing_piece, animated_board)
-    turn_recovery.active_side = "b"
-    for _ in range(turn_recovery.recovery_frames + 1):
-        turn_recovery.update(fen_init, recovered_board)
-    assert turn_recovery.last_stable_fen.split()[1] == "b"
-
-    # 4. 常规走法 (帅移步)
+    # 4. 常规合法走法（红车进一）
     debouncer.update(fen_move)
     time.sleep(0.06)
     ev_m = debouncer.update(fen_move)
     assert ev_m is not None and ev_m["event_type"] == "move"
-    assert ev_m["move"]["uci"] == "f0e0"
+    assert ev_m["move"]["uci"] == "g8g7"
 
-    # 5. 吃子走法 (俥吃黑马)：单独建立合法的吃子前盘面。
+    # 5. 吃子走法（开局红炮直取黑马）。
     capture_debouncer = BoardDebouncer(required_stable_frames=2, min_stable_seconds=0.05)
-    capture_debouncer.update(fen_pre_capture)
-    capture_debouncer.update(fen_capture)
+    capture_board = fen_to_matrix(START_FEN)[0]
+    capture_move = parse_uci(capture_board, "h2h9")
+    assert capture_move is not None and is_legal_move(capture_board, capture_move, "r")
+    captured_board = apply_move(capture_board, capture_move)
+    captured_fen = matrix_to_fen(captured_board, "b")
+    capture_debouncer.update(START_FEN, capture_board)
+    capture_debouncer.update(captured_fen, captured_board)
     time.sleep(0.06)
-    ev_c = capture_debouncer.update(fen_capture)
+    ev_c = capture_debouncer.update(captured_fen, captured_board)
     assert ev_c is not None and ev_c["event_type"] == "move"
-    assert ev_c["move"]["uci"] == "g8g6"
+    assert ev_c["move"]["uci"] == "h2h9"
     assert ev_c["move"]["captured"] == "b_n"
 
     # 6. 退出棋盘时的空画面不能清盘；新局稳定出现后必须整盘切换并广播。
@@ -332,7 +338,13 @@ def test_debouncer_and_moves():
     for _ in range(5):
         reopen_event = session_debouncer.update(another_game) or reopen_event
         time.sleep(0.015)
-    assert reopen_event and reopen_event["event_type"] == "session_reset"
+    assert reopen_event is None, "中盘画面不能仅凭空帧自动覆盖旧盘面"
+    assert session_debouncer.last_stable_fen == standard_fen
+    session_debouncer.request_reanchor()
+    for _ in range(5):
+        reopen_event = session_debouncer.update(another_game) or reopen_event
+        time.sleep(0.015)
+    assert reopen_event and reopen_event["event_type"] == "manual_reanchor"
     assert session_debouncer.last_stable_fen == another_game
     assert session_debouncer.session_revision == 3
 
@@ -373,7 +385,7 @@ def test_debouncer_and_moves():
     caught = catchup.update(two_fen, two_plies)
     assert caught and caught["event_type"] == "catchup" and len(caught["moves"]) == 2
     assert catchup.active_side == "r" and catchup.last_stable_board == two_plies
-    print("  ✓ 逐格防抖、双步追帧、回合锁定、空画面保护与新局/重开同步全部通过")
+    print("  ✓ 合法走子跟踪、四步追赶、回合锁定、空画面保护与新局/重开同步全部通过")
 
 
 def _free_tcp_port() -> int:
@@ -454,7 +466,7 @@ def test_port_fallback_with_occupied_defaults():
             assert state.get("piece_count") == 10
 
             async def fallback_ws_check():
-                async with websockets.connect(runtime["ws_url"], open_timeout=2) as ws:
+                async with websockets.connect(runtime["ws_url"], open_timeout=2, proxy=None) as ws:
                     state = json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
                     assert state["piece_count"] == 10
             asyncio.run(fallback_ws_check())
@@ -476,14 +488,15 @@ def test_session_reset_websocket():
     new_fen = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
     old_board = fen_to_matrix(old_fen)[0]
     new_board = fen_to_matrix(new_fen)[0]
+    show_new_game = threading.Event()
 
     class SequenceRecognizer:
         def __init__(self):
             self.frames = 0
         def recognize(self, image):
             self.frames += 1
-            board = old_board if self.frames <= 12 else new_board
-            fen = old_fen if self.frames <= 12 else new_fen
+            board = new_board if show_new_game.is_set() else old_board
+            fen = new_fen if show_new_game.is_set() else old_fen
             return {
                 "board": board, "fen": fen,
                 "piece_count": sum(piece is not None for row in board for piece in row),
@@ -500,13 +513,18 @@ def test_session_reset_websocket():
                         debouncer=debouncer, ws_port=ws_port, http_port=http_port,
                         interval=0.03, idle_timeout=0)
     server.start()
-    time.sleep(0.1)
     try:
+        old_ready_deadline = time.monotonic() + 5
+        while server.get_latest_state().get("piece_count") != 10:
+            assert time.monotonic() < old_ready_deadline, "旧盘面未完成首帧锚定"
+            time.sleep(0.02)
+
         async def receive_reset():
-            async with websockets.connect(f"ws://127.0.0.1:{ws_port}") as ws:
-                deadline = time.monotonic() + 4
+            async with websockets.connect(f"ws://127.0.0.1:{ws_port}", proxy=None) as ws:
+                show_new_game.set()
+                deadline = time.monotonic() + 6
                 while time.monotonic() < deadline:
-                    message = json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
+                    message = json.loads(await asyncio.wait_for(ws.recv(), timeout=6))
                     if message.get("event_type") == "session_reset":
                         return message
                 raise AssertionError("未收到 session_reset WebSocket 事件")
@@ -530,7 +548,7 @@ def test_dashboard_idle_shutdown():
     time.sleep(0.15)  # 等待 WebSocket 监听线程完成 bind
     try:
         async def hold_dashboard_connection():
-            async with websockets.connect(f"ws://127.0.0.1:{ws_port}") as ws:
+            async with websockets.connect(f"ws://127.0.0.1:{ws_port}", proxy=None) as ws:
                 initial = {}
                 for _ in range(3):
                     initial = json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
@@ -579,16 +597,19 @@ def test_sync_server_end_to_end():
     try:
         # 等待识别首帧真实完成，不使用固定睡眠造成慢机器伪失败。
         ready_state = {}
+        last_http_error = None
         for _ in range(40):
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/status", timeout=0.5) as resp:
                     ready_state = json.loads(resp.read().decode("utf-8"))
                 if ready_state.get("piece_count") == 10:
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                last_http_error = exc
             time.sleep(0.1)
-        assert ready_state.get("piece_count") == 10, f"同步服务首帧未就绪: {ready_state}"
+        assert ready_state.get("piece_count") == 10, (
+            f"同步服务首帧未就绪: {ready_state}; HTTP 错误: {last_http_error!r}"
+        )
 
         # 1. 测试 HTTP /fen
         with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/fen", timeout=2.0) as resp:
@@ -606,7 +627,7 @@ def test_sync_server_end_to_end():
             html_body = resp.read().decode("utf-8")
             assert "象棋盘面同步" in html_body
             assert "楚 河" in html_body and "最新 FEN" not in html_body
-            assert "AI 执下方" in html_body and "实时只读 · 自动跟随实盘" in html_body
+            assert "AI 执下方" in html_body and "实时只读 · 合法走子跟踪" in html_body
             assert "棋盘模拟" not in html_body and "回退一步" not in html_body
             assert "AI 强度" in html_body and "清理缓存并重新读取对局" in html_body
             assert "/api/live/reset" in html_body
@@ -696,7 +717,7 @@ def test_sync_server_end_to_end():
 
         # 5. 测试 WebSocket 客户端
         async def client_test():
-            async with websockets.connect(f"ws://127.0.0.1:{ws_port}") as ws:
+            async with websockets.connect(f"ws://127.0.0.1:{ws_port}", proxy=None) as ws:
                 raw_msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 msg_data = json.loads(raw_msg)
                 assert "fen" in msg_data
@@ -706,7 +727,7 @@ def test_sync_server_end_to_end():
         async def hostile_ws_test():
             try:
                 async with websockets.connect(
-                    f"ws://127.0.0.1:{ws_port}", origin="https://evil.example",
+                    f"ws://127.0.0.1:{ws_port}", origin="https://evil.example", proxy=None,
                 ):
                     raise AssertionError("外部网页不应能读取本地 WebSocket 盘面")
             except websockets.exceptions.InvalidStatus:

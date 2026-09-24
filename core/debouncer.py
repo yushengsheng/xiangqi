@@ -1,8 +1,8 @@
-"""逐格盘面稳定器。
+"""规则驱动的实时棋局跟踪器。
 
-90 个交叉点各自追踪观测值。单独出现的“棋子消失”永远不会直接改写稳定盘面；
-只有来源格持续为空、目标格持续出现同一枚棋子，并且两格组成可行走子时，才原子
-提交这两个格。这样选中发光、弹起、缩放等特效不会让看板丢子。
+视觉识别只提供观测，内部盘面只能由标准开局、新会话或经过象棋规则证明的走子
+改变。单独丢子、多子、原位变色和无法解释的整盘跳变，无论持续多少帧都不会
+覆盖稳定盘面。这样短暂高亮、动画、漏帧和字形误判只能造成延迟，不能破坏棋局。
 """
 
 import time
@@ -12,8 +12,8 @@ from typing import Optional, Dict, Any, Callable, List, Tuple
 from core.fen import fen_to_matrix, matrix_to_fen, PIECE_NAMES_ZH
 from core.position_validation import is_structurally_valid_board
 from core.xiangqi import (
-    FLIPPED_START_FEN, START_FEN, apply_move, generate_legal_moves,
-    infer_bottom_side, is_pseudo_legal_move, other_side,
+    FLIPPED_START_FEN, START_FEN, Move, apply_move, generate_legal_moves,
+    infer_bottom_side, is_legal_move, other_side,
 )
 
 Board = List[List[Optional[str]]]
@@ -26,7 +26,6 @@ class BoardDebouncer:
                  on_change_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.required_stable_frames = max(1, required_stable_frames)
         self.min_stable_seconds = max(0.0, min_stable_seconds)
-        self.recovery_frames = max(4, self.required_stable_frames * 2)
         self.resync_frames = max(4, self.required_stable_frames + 2)
         self.resync_seconds = max(0.8, self.min_stable_seconds * 4)
         self.initial_frames = 1
@@ -36,6 +35,9 @@ class BoardDebouncer:
         self.last_stable_fen: Optional[str] = None
         self.last_stable_board: Optional[Board] = None
         self.move_history: List[Dict[str, Any]] = []
+        # Exact positions preceding verified moves.  They are the only states
+        # an in-game undo may automatically return to.
+        self._undo_positions: List[Tuple[Board, str]] = []
         self.last_rejection_reason: Optional[str] = None
         self.session_revision: int = 0
         self.active_side: str = "r"
@@ -57,21 +59,21 @@ class BoardDebouncer:
         """所有实时源至少双帧确认；天天窗口仅缩短时间门槛，不牺牲回合稳定性。"""
         self.required_stable_frames = 2
         self.min_stable_seconds = 0.05 if fast_exact_source else 0.08
-        self.recovery_frames = 4
         # 单步仍使用快速双帧确认；整盘重锚必须更保守。小程序的抬子、落子
         # 和吃子动画可能连续维持两三帧，过早重锚会同时产生丢子和幽灵棋子。
-        self.resync_frames = 4
-        self.resync_seconds = 0.35 if fast_exact_source else 0.8
+        self.resync_frames = 8 if fast_exact_source else 5
+        self.resync_seconds = 1.0 if fast_exact_source else 1.2
         # 首帧可能恰好处于抬子/落子动画，不能把一批暂时消失的棋子
         # 当成初始稳定盘面展示。正常运行中的走子仍使用快速双帧确认。
-        self.initial_frames = 4 if fast_exact_source else 2
-        self.initial_seconds = 0.35 if fast_exact_source else 0.15
+        self.initial_frames = 8 if fast_exact_source else 3
+        self.initial_seconds = 1.0 if fast_exact_source else 0.35
 
     def reset(self) -> None:
         """切换游戏平台或捕获源时清空盘面，但保留递增的会话编号。"""
         self.last_stable_fen = None
         self.last_stable_board = None
         self.move_history = []
+        self._undo_positions = []
         self.last_rejection_reason = None
         self.active_side = "r"
         self._hint_signature = None
@@ -245,6 +247,65 @@ class BoardDebouncer:
             self._resync_count = 1
             self._resync_since = now
 
+    @classmethod
+    def _standard_start_from_observation(
+        cls,
+        observed: Board,
+        occupancy: Optional[List[List[bool]]],
+        occupied_sides: Optional[List[List[Optional[str]]]],
+    ) -> Optional[Board]:
+        """Return an exact standard start when the frame is an unambiguous subset.
+
+        New games have a known state, so a selected/highlighted source square must
+        not make cold start permanently omit that piece.  Every recognized piece
+        and every positive occupancy observation must agree with one orientation;
+        at least 28 occupied/recognized cells are required to avoid mistaking a
+        later sparse position for a fresh game.
+        """
+        standards = (
+            fen_to_matrix(START_FEN)[0],
+            fen_to_matrix(FLIPPED_START_FEN)[0],
+        )
+        occupancy_valid = (
+            isinstance(occupancy, list)
+            and len(occupancy) == 10
+            and all(isinstance(row, list) and len(row) == 9 for row in occupancy)
+        )
+        sides = occupied_sides if isinstance(occupied_sides, list) else None
+        for standard in standards:
+            evidence = 0
+            valid = True
+            for row in range(10):
+                for col in range(9):
+                    expected = standard[row][col]
+                    seen = observed[row][col]
+                    if seen is not None:
+                        evidence += 1
+                        if seen != expected:
+                            valid = False
+                            break
+                    if occupancy_valid and occupancy[row][col]:
+                        evidence += 1 if seen is None else 0
+                        if expected is None:
+                            valid = False
+                            break
+                        side = None
+                        if (
+                            sides
+                            and row < len(sides)
+                            and isinstance(sides[row], list)
+                            and col < len(sides[row])
+                        ):
+                            side = sides[row][col]
+                        if side in ("r", "b") and expected[0] != side:
+                            valid = False
+                            break
+                if not valid:
+                    break
+            if valid and evidence >= 28:
+                return cls._copy_board(standard)
+        return None
+
     def _should_resync(self, observed: Board, now: float) -> bool:
         if (
             self._resync_signature != self._signature(observed)
@@ -254,48 +315,11 @@ class BoardDebouncer:
         ):
             return False
         assert self.last_stable_board is not None
-        differences = sum(
-            observed[row][col] != self.last_stable_board[row][col]
-            for row in range(10) for col in range(9)
-        )
-        stable_plausible = self._is_plausible_board(self.last_stable_board)
-        # Same-game lag must never be disguised as a new session: that allowed
-        # a transient glyph error to turn a knight into a rook.  A new session
-        # requires a standard start, an explicit menu/empty transition, or an
-        # already-invalid old anchor.
-        return (
-            self._initial_side(observed) == "r"
-            or not stable_plausible
-            or (self._source_discontinuity and differences >= 4)
-        )
-
-    @staticmethod
-    def _inventory_compatible(previous: Board, observed: Board) -> bool:
-        """Within one game pieces may be captured, but never change type or multiply."""
-        before = Counter(piece for row in previous for piece in row if piece)
-        after = Counter(piece for row in observed for piece in row if piece)
-        return all(count <= before.get(piece, 0) for piece, count in after.items())
-
-    def _should_reanchor(self, observed: Board, now: float,
-                         confirmed_side: Optional[str]) -> bool:
-        if (
-            self.last_stable_board is None
-            or self._resync_signature != self._signature(observed)
-            or self._resync_count < self.resync_frames
-            or not self._is_plausible_board(observed)
-            or not self._inventory_compatible(self.last_stable_board, observed)
-        ):
-            return False
-        age = now - self._resync_since
-        differences = sum(
-            observed[row][col] != self.last_stable_board[row][col]
-            for row in range(10) for col in range(9)
-        )
-        if differences >= 4 and age >= self.resync_seconds:
-            return True
-        if differences >= 2 and confirmed_side in ("r", "b") and age >= self.min_stable_seconds:
-            return True
-        return differences >= 2 and age >= max(1.2, self.resync_seconds * 2.4)
+        # A menu/empty transition is not proof that the next arbitrary board is
+        # a different game: capture interruptions also produce empty frames.
+        # Only the known 32-piece opening can be adopted automatically.  A
+        # midgame restart needs an explicit manual re-read.
+        return self._initial_side(observed) == "r"
 
     def _track_observations(self, observed: Board, now: float) -> None:
         assert self.last_stable_board is not None
@@ -319,11 +343,128 @@ class BoardDebouncer:
             and now - self._candidate_since[row][col] >= self.min_stable_seconds
         )
 
-    def _find_catchup_path(self, observed: Board, max_plies: int = 2,
+    @staticmethod
+    def _mismatch_count(left: Board, right: Board) -> int:
+        return sum(
+            left[row][col] != right[row][col]
+            for row in range(10) for col in range(9)
+        )
+
+    @staticmethod
+    def _inventory(board: Board) -> Counter:
+        return Counter(piece for row in board for piece in row if piece)
+
+    def _remember_undo_position(self, board: Board, mover: str) -> None:
+        self._undo_positions.append((self._copy_board(board), mover))
+        if len(self._undo_positions) > 24:
+            self._undo_positions.pop(0)
+
+    def _find_undo_transition(
+        self, observed: Board, confirmed_side: Optional[str],
+        visual: Optional[Dict[str, Any]],
+    ) -> Optional[Tuple[int, str, Optional[Move]]]:
+        """Accept only an exact recorded rollback or a proven alternative move."""
+        for index in range(len(self._undo_positions) - 1, -1, -1):
+            historical, mover = self._undo_positions[index]
+            if historical == observed:
+                return index, mover, None
+
+        # If the other player replays before a capture frame shows the reverted
+        # position, the last visual marker must identify the alternative move.
+        if not isinstance(visual, dict):
+            return None
+        source, target = visual.get("from") or {}, visual.get("to") or {}
+        try:
+            sr, sc = int(source["row"]), int(source["col"])
+            dr, dc = int(target["row"]), int(target["col"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (0 <= sr < 10 and 0 <= sc < 9 and 0 <= dr < 10 and 0 <= dc < 9):
+            return None
+        matches = []
+        for index, (historical, mover) in enumerate(self._undo_positions):
+            piece = historical[sr][sc]
+            if (
+                piece is None or piece[0] != mover
+                or visual.get("side") != mover
+                or visual.get("piece") != piece
+                or confirmed_side != mover
+            ):
+                continue
+            move = Move(sr, sc, dr, dc, piece, historical[dr][dc])
+            if not is_legal_move(historical, move, mover):
+                continue
+            if apply_move(historical, move) == observed:
+                matches.append((index, other_side(mover), move))
+        return matches[0] if len(matches) == 1 else None
+
+    def _commit_undo_transition(
+        self, observed: Board, transition: Tuple[int, str, Optional[Move]],
+    ) -> Dict[str, Any]:
+        index, next_side, move = transition
+        old_fen = self.last_stable_fen
+        historical = self._copy_board(self._undo_positions[index][0])
+        self._undo_positions = self._undo_positions[:index]
+        self.move_history = []
+        if move is not None:
+            self._remember_undo_position(historical, move.piece[0])
+        self.last_stable_board = self._copy_board(observed)
+        self.active_side = next_side
+        self.last_stable_fen = matrix_to_fen(
+            observed, "b" if next_side == "b" else "w",
+        )
+        self.session_revision += 1
+        self._reset_all_candidates()
+        self._reset_resync_candidate()
+        self._clear_source_discontinuity()
+        self.last_rejection_reason = None
+        payload = move.to_dict() if move is not None else None
+        description = "检测到悔棋后改走，已按历史盘面及合法走子同步" if move else "检测到悔棋，已回到记录过的盘面"
+        event = {
+            "event_type": "undo_branch" if move else "undo",
+            "fen": self.last_stable_fen,
+            "old_fen": old_fen,
+            "timestamp": time.time(),
+            "session_revision": self.session_revision,
+            "move": payload,
+            "description": description,
+        }
+        if self.on_change_callback:
+            self.on_change_callback(event)
+        return event
+
+    def _find_catchup_path(self, observed: Board, max_plies: int = 4,
                            last_move_side: Optional[str] = None):
-        """用上一稳定盘面推演漏采的 1～2 步，处理对手在两帧之间快速走完的情况。"""
+        """Find a proven 1..N-ply path from the stable board to the observation.
+
+        Search is beam-bounded and ordered by distance to the observed board.
+        Importantly, a board is committed only on an *exact* legal match; beam
+        scoring can affect latency but can never authorize an invalid state.
+        """
         if self.last_stable_board is None:
             return None
+        before_inventory = self._inventory(self.last_stable_board)
+        target_inventory = self._inventory(observed)
+        if any(
+            count > before_inventory.get(piece, 0)
+            for piece, count in target_inventory.items()
+        ):
+            return None
+        capture_delta = sum(before_inventory.values()) - sum(target_inventory.values())
+        if capture_delta < 0 or capture_delta > max_plies:
+            return None
+        changed_cells = {
+            (row, col)
+            for row in range(10) for col in range(9)
+            if self.last_stable_board[row][col] != observed[row][col]
+        }
+        # A visual last-mover hint identifies a side, not the number of plies.
+        # A two-cell OCR error must never be rationalized as a four-ply path
+        # padded with reversible moves that leave no trace in the final frame.
+        max_plies = min(max_plies, (len(changed_cells) + 1) // 2)
+        if max_plies < 1:
+            return None
+
         if self.active_side in ("r", "b"):
             starts = [self.active_side]
             # 只有画面中的稳定落点明确表明回合锁已漂移时，才尝试另一方；
@@ -333,34 +474,94 @@ class BoardDebouncer:
         else:
             starts = ["r", "b"]
         bottom = infer_bottom_side(self.last_stable_board)
-        all_matches = []
+        target_signature = self._signature(observed)
+        beam_width = 192
+
+        def search_from(start_side: str):
+            # One node is (board, side_to_move, path, captures_so_far).
+            initial = self._copy_board(self.last_stable_board)
+            frontier = [(initial, start_side, [], 0)]
+            seen = {(self._signature(initial), start_side, 0)}
+            for depth in range(1, max_plies + 1):
+                remaining = max_plies - depth
+                next_nodes = []
+                matches = []
+                for board, side, path, captures in frontier:
+                    for move in generate_legal_moves(board, side, bottom):
+                        if (
+                            (move.sr, move.sc) not in changed_cells
+                            and (move.dr, move.dc) not in changed_cells
+                        ):
+                            continue
+                        after = apply_move(board, move)
+                        next_captures = captures + (1 if move.captured else 0)
+                        if next_captures > capture_delta:
+                            continue
+                        inventory = self._inventory(after)
+                        if any(
+                            inventory.get(piece, 0) < count
+                            for piece, count in target_inventory.items()
+                        ):
+                            continue
+                        captures_left = (
+                            sum(inventory.values()) - sum(target_inventory.values())
+                        )
+                        if captures_left < 0 or captures_left > remaining:
+                            continue
+                        next_side = other_side(side)
+                        next_path = path + [move]
+                        signature = self._signature(after)
+                        if signature == target_signature:
+                            if (
+                                last_move_side not in ("r", "b")
+                                or move.piece[0] == last_move_side
+                            ):
+                                matches.append((next_path, next_side))
+                            continue
+
+                        mismatches = self._mismatch_count(after, observed)
+                        # Every inferred ply must leave evidence in a cell that
+                        # differs in the final observed position.
+                        if (mismatches + 1) // 2 > remaining:
+                            continue
+                        key = (signature, next_side, depth)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        next_nodes.append((
+                            mismatches,
+                            captures_left,
+                            after,
+                            next_side,
+                            next_path,
+                            next_captures,
+                        ))
+
+                if matches:
+                    resulting_sides = {next_side for _, next_side in matches}
+                    if len(resulting_sides) == 1:
+                        return matches[0]
+                    return None
+                next_nodes.sort(key=lambda item: (item[0], item[1], len(item[4])))
+                frontier = [
+                    (board, side, path, captures)
+                    for _, _, board, side, path, captures in next_nodes[:beam_width]
+                ]
+                if not frontier:
+                    break
+            return None
+
+        matches = []
         for start_side in starts:
-            matches = []
-            for first in generate_legal_moves(self.last_stable_board, start_side, bottom):
-                after_first = apply_move(self.last_stable_board, first)
-                if after_first == observed:
-                    matches.append(([first], other_side(start_side)))
-                    continue
-                if max_plies < 2:
-                    continue
-                second_side = other_side(start_side)
-                for second in generate_legal_moves(after_first, second_side, bottom):
-                    if apply_move(after_first, second) == observed:
-                        matches.append(([first, second], start_side))
-            if last_move_side in ("r", "b"):
-                matches = [(path, side) for path, side in matches
-                           if path[-1].piece[0] == last_move_side]
-            if not matches:
-                continue
-            all_matches.extend(matches)
-            # 不同走法顺序可能到达同一盘面；只要最终轮次一致即可安全恢复。
-            resulting_sides = {side for _, side in matches}
-            if self.active_side in ("r", "b") and len(resulting_sides) == 1:
-                return matches[0][0], matches[0][1]
-        if all_matches:
-            resulting_sides = {side for _, side in all_matches}
+            match = search_from(start_side)
+            if match is not None:
+                if self.active_side in ("r", "b"):
+                    return match
+                matches.append(match)
+        if matches:
+            resulting_sides = {next_side for _, next_side in matches}
             if len(resulting_sides) == 1:
-                return all_matches[0][0], all_matches[0][1]
+                return matches[0]
         return None
 
     def _commit_catchup(self, observed: Board, path, next_side: str) -> Dict[str, Any]:
@@ -368,6 +569,7 @@ class BoardDebouncer:
         board = self._copy_board(self.last_stable_board)
         payloads = []
         for move in path:
+            self._remember_undo_position(board, move.piece[0])
             payload = move.to_dict()
             payload["description"] = (
                 f"{PIECE_NAMES_ZH.get(move.piece, '?')} 从 "
@@ -406,8 +608,15 @@ class BoardDebouncer:
                occupancy: Optional[List[List[bool]]] = None,
                occupied_sides: Optional[List[List[Optional[str]]]] = None,
                last_visual_move: Optional[Dict[str, Any]] = None,
+               complete_observation: bool = True,
                ) -> Optional[Dict[str, Any]]:
         observed = self._board_from_input(current_fen, current_board)
+        if self.last_stable_board is None or self._force_reanchor:
+            standard = self._standard_start_from_observation(
+                observed, occupancy, occupied_sides,
+            )
+            if standard is not None:
+                observed = standard
         if not self._force_reanchor:
             observed = self._reconcile_occupancy(observed, occupancy, occupied_sides)
         now = time.perf_counter()
@@ -442,6 +651,7 @@ class BoardDebouncer:
                 self.last_stable_board, "b" if self.active_side == "b" else "w"
             )
             self.session_revision += 1
+            self._undo_positions = []
             self._reset_all_candidates()
             self._reset_resync_candidate()
             self._clear_source_discontinuity()
@@ -469,6 +679,23 @@ class BoardDebouncer:
         # 手动重读使用独立的双帧候选，连“新盘面与旧盘面完全相同”的情况
         # 也能正常完成。普通重同步会忽略相同盘面，不能复用它的跟踪入口。
         if self._force_reanchor:
+            if observed != self.last_stable_board and self._initial_side(observed) != "r":
+                departures = any(
+                    self.last_stable_board[row][col] is not None
+                    and observed[row][col] is None
+                    for row in range(10) for col in range(9)
+                )
+                arrivals = any(
+                    observed[row][col] is not None
+                    and observed[row][col] != self.last_stable_board[row][col]
+                    for row in range(10) for col in range(9)
+                )
+                if departures and not arrivals:
+                    self._reset_resync_candidate()
+                    self.last_rejection_reason = (
+                        "重读画面只有孤立少子，已保留上一正确盘面"
+                    )
+                    return None
             signature = self._signature(observed)
             if signature == self._resync_signature:
                 self._resync_count += 1
@@ -486,6 +713,15 @@ class BoardDebouncer:
             self.last_rejection_reason = "正在后台校验新的完整盘面"
             return None
 
+        # A reverted rook/horse/general position can itself look like a legal
+        # reverse move.  If it exactly matches a recorded pre-move board and
+        # the current turn belongs to the other side, wait for the stronger
+        # undo confirmation instead of committing that inverse move early.
+        undo_candidate = complete_observation and any(
+            historical == observed and mover != self.active_side
+            for historical, mover in self._undo_positions
+        )
+
         if observed == self.last_stable_board and self.active_side == "unknown" and confirmed_side:
             self.active_side = other_side(confirmed_side)
             self.last_stable_fen = matrix_to_fen(observed, "b" if self.active_side == "b" else "w")
@@ -502,7 +738,7 @@ class BoardDebouncer:
         # 完整盘面差分及象棋走法四者完全一致，就无需再等第二个轮询周期；
         # 这能让带高亮的马/将/帅立即跟上，同时不会把单帧 OCR 猜测写入盘面。
         visual = last_visual_move if isinstance(last_visual_move, dict) else None
-        if visual:
+        if visual and not undo_candidate:
             source = visual.get("from") or {}
             target = visual.get("to") or {}
             piece = visual.get("piece")
@@ -568,7 +804,10 @@ class BoardDebouncer:
                     )
                     legal_moves.append((score, from_col, from_row, to_col, to_row, piece))
 
-        if legal_moves and differences == 2 and len(departures) + len(destinations) == 2:
+        if (
+            legal_moves and not undo_candidate and differences == 2
+            and len(departures) + len(destinations) == 2
+        ):
             # 单步最多涉及来源与目标两个格。多个候选时只接受证据最强且唯一
             # 的配对，避免特效误分类造成跳子。
             if self.active_side in ("r", "b"):
@@ -581,10 +820,12 @@ class BoardDebouncer:
                 return self._commit_move(from_col, from_row, to_col, to_row, piece)
             self.last_rejection_reason = "存在多个同强度走子候选，等待整盘稳定或消除歧义"
 
-        # 对手走得很快时，采集可能直接从上一步跳到两步后的盘面。用上一稳定
-        # 布局按合法走法推演，而不是依赖必须捕捉到中间动画帧。
+        # 捕获线程偶尔可能直接从上一步跳到数步后的盘面。使用上一稳定布局
+        # 枚举合法路径，只有精确到达当前观测时才一次性追上；不再使用未经
+        # 走法证明的整盘覆盖。
         if (
-            self._resync_signature == self._signature(observed)
+            not undo_candidate
+            and self._resync_signature == self._signature(observed)
             and self._resync_count >= self.required_stable_frames
             and now - self._resync_since >= self.min_stable_seconds
         ):
@@ -592,67 +833,36 @@ class BoardDebouncer:
                 observed[row][col] != self.last_stable_board[row][col]
                 for row in range(10) for col in range(9)
             )
-            if 2 <= differences <= 4 and self._is_plausible_board(observed):
-                catchup = self._find_catchup_path(observed, max_plies=2,
-                                                  last_move_side=confirmed_side)
+            if 2 <= differences <= 8 and self._is_plausible_board(observed):
+                max_catchup_plies = 4 if confirmed_side in ("r", "b") else 2
+                catchup = self._find_catchup_path(
+                    observed,
+                    max_plies=max_catchup_plies,
+                    last_move_side=confirmed_side,
+                )
                 if catchup is not None:
                     path, next_side = catchup
                     return self._commit_catchup(observed, path, next_side)
+
+        if (
+            complete_observation
+            and self._resync_signature == self._signature(observed)
+            and self._resync_count >= self.resync_frames
+            and now - self._resync_since >= self.resync_seconds
+        ):
+            transition = self._find_undo_transition(
+                observed, confirmed_side, visual,
+            )
+            if transition is not None:
+                return self._commit_undo_transition(observed, transition)
 
         # 2. 新开一局、退出后重开通常会同时改变多个格子。只有完整盘面在
         # 连续帧和时间上都稳定后才整盘切换，菜单/空画面不会清空当前盘面。
         if self._should_resync(observed, now):
             return self._commit_resync(observed, confirmed_side)
 
-        # A valid current board may be more than two plies ahead after a brief
-        # capture/animation miss.  Re-anchor the same session only when piece
-        # inventory is monotonic, so stale OCR can never morph one type into
-        # another.  The next visual move re-establishes turn order if unknown.
-        if self._should_reanchor(observed, now, confirmed_side):
-            return self._commit_reanchor(observed, confirmed_side)
-
-        # 3. 单独缺子/原位变色一律不提交。只允许空格上持续出现棋子，用于
-        # 服务恰好在选中特效期间启动后，取消选中时逐格补回缺失棋子。
-        recovered = []
-        has_pending_departure = any(
-            self.last_stable_board[row][col] is not None
-            and self._candidate[row][col] is None
-            and self._candidate_count[row][col] > 0
-            for row in range(10) for col in range(9)
-        )
-        if not has_pending_departure:
-            for row in range(10):
-                for col in range(9):
-                    if (
-                        self.last_stable_board[row][col] is None
-                        and self._candidate[row][col] is not None
-                        and self._cell_ready(row, col, now, self.recovery_frames)
-                    ):
-                        self.last_stable_board[row][col] = self._candidate[row][col]
-                        recovered.append((col, row, self._candidate[row][col]))
-
-        if recovered:
-            old_fen = self.last_stable_fen
-            self.last_stable_fen = matrix_to_fen(
-                self.last_stable_board, "b" if self.active_side == "b" else "w"
-            )
-            self._reset_all_candidates()
-            self._reset_resync_candidate()
-            self.last_rejection_reason = None
-            event = {
-                "event_type": "recovered",
-                "fen": self.last_stable_fen,
-                "old_fen": old_fen,
-                "timestamp": time.time(),
-                "move": None,
-                "description": f"逐格恢复 {len(recovered)} 枚被特效遮挡的棋子",
-            }
-            if self.on_change_callback:
-                self.on_change_callback(event)
-            return event
-
         if departures or destinations:
-            self.last_rejection_reason = "格子变化尚未组成唯一有效走子"
+            self.last_rejection_reason = "画面变化尚未组成唯一合法走子，已保留上一正确盘面"
         return None
 
     def _commit_resync(self, observed: Board, last_move_side: Optional[str] = None) -> Dict[str, Any]:
@@ -665,6 +875,7 @@ class BoardDebouncer:
             self.last_stable_board, "b" if self.active_side == "b" else "w"
         )
         self.session_revision += 1
+        self._undo_positions = []
         self._reset_all_candidates()
         self._reset_resync_candidate()
         self._clear_source_discontinuity()
@@ -689,9 +900,15 @@ class BoardDebouncer:
         old_fen = self.last_stable_fen
         same_board = observed == self.last_stable_board
         previous_side = self.active_side
+        historical_side = next((
+            mover for board, mover in reversed(self._undo_positions)
+            if board == observed
+        ), None)
         self.last_stable_board = self._copy_board(observed)
         inferred_side = self._initial_side(self.last_stable_board)
-        if inferred_side == "unknown" and last_move_side in ("r", "b"):
+        if historical_side in ("r", "b"):
+            inferred_side = historical_side
+        elif inferred_side == "unknown" and last_move_side in ("r", "b"):
             inferred_side = other_side(last_move_side)
         elif inferred_side == "unknown" and same_board:
             inferred_side = previous_side
@@ -701,6 +918,7 @@ class BoardDebouncer:
         )
         self.session_revision += 1
         self.move_history = []
+        self._undo_positions = []
         self._reset_all_candidates()
         self._reset_resync_candidate()
         self._clear_source_discontinuity()
@@ -719,38 +937,12 @@ class BoardDebouncer:
             self.on_change_callback(event)
         return event
 
-    def _commit_reanchor(self, observed: Board,
-                         last_move_side: Optional[str] = None) -> Dict[str, Any]:
-        old_fen = self.last_stable_fen
-        self.last_stable_board = self._copy_board(observed)
-        self.active_side = (
-            other_side(last_move_side) if last_move_side in ("r", "b") else "unknown"
-        )
-        self.last_stable_fen = matrix_to_fen(
-            self.last_stable_board, "b" if self.active_side == "b" else "w"
-        )
-        self._reset_all_candidates()
-        self._reset_resync_candidate()
-        self._clear_source_discontinuity()
-        self._force_reanchor = False
-        self.last_rejection_reason = None
-        event = {
-            "event_type": "reanchor",
-            "fen": self.last_stable_fen,
-            "old_fen": old_fen,
-            "timestamp": time.time(),
-            "move": None,
-            "description": "检测到漏采多步，已重新锚定当前实盘",
-        }
-        if self.on_change_callback:
-            self.on_change_callback(event)
-        return event
-
     def _commit_move(self, from_col: int, from_row: int,
                      to_col: int, to_row: int, piece: str) -> Dict[str, Any]:
         assert self.last_stable_board is not None
         old_fen = self.last_stable_fen
         captured = self.last_stable_board[to_row][to_col]
+        self._remember_undo_position(self.last_stable_board, piece[0])
         self.last_stable_board[from_row][from_col] = None
         self.last_stable_board[to_row][to_col] = piece
         self.active_side = other_side(piece[0])
@@ -795,7 +987,10 @@ class BoardDebouncer:
     @staticmethod
     def _is_legal_piece_move(board: Board, sc: int, sr: int,
                              dc: int, dr: int, piece: str) -> bool:
-        return is_pseudo_legal_move(board, sc, sr, dc, dr, piece)
+        if not (0 <= sr < 10 and 0 <= sc < 9 and 0 <= dr < 10 and 0 <= dc < 9):
+            return False
+        move = Move(sr, sc, dr, dc, piece, board[dr][dc])
+        return is_legal_move(board, move, piece[0])
 
     def get_stable_state(self) -> Tuple[Optional[str], Optional[Board]]:
         return self.last_stable_fen, self._copy_board(self.last_stable_board) if self.last_stable_board else None

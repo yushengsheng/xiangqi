@@ -273,6 +273,26 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(event["event_type"], "initial")
         self.assertEqual(tracker.last_stable_board, self.start)
 
+    def test_standard_start_repairs_a_temporarily_hidden_piece(self):
+        tracker = BoardDebouncer(2, 0)
+        tracker.initial_frames = 2
+        tracker.initial_seconds = 0
+        observed = [row[:] for row in self.start]
+        observed[9][1] = None
+        occupancy = [[piece is not None for piece in row] for row in observed]
+        sides = [[piece[0] if piece else None for piece in row] for row in observed]
+
+        self.assertIsNone(tracker.update(
+            matrix_to_fen(observed), observed, occupancy=occupancy,
+            occupied_sides=sides,
+        ))
+        event = tracker.update(
+            matrix_to_fen(observed), observed, occupancy=occupancy,
+            occupied_sides=sides,
+        )
+        self.assertEqual(event["event_type"], "initial")
+        self.assertEqual(tracker.last_stable_board, self.start)
+
     def test_unchanged_dynamic_grid_reuses_cell_recognition(self):
         image = cv2.imread("test_images/tiantian_host_probe.png")
         recognizer = TiantianRecognizer()
@@ -319,10 +339,11 @@ class RecoveryTests(unittest.TestCase):
 
     def test_dashboard_always_reenters_live_follow_mode(self):
         self.assertIn("post('/api/ai/follow',{})", WEB_DASHBOARD_HTML)
-        self.assertIn("实时只读 · 自动跟随实盘", WEB_DASHBOARD_HTML)
+        self.assertIn("实时只读 · 合法走子跟踪", WEB_DASHBOARD_HTML)
         self.assertNotIn('id="btn-play"', WEB_DASHBOARD_HTML)
         self.assertIn("setInterval(refreshSnapshot,600)", WEB_DASHBOARD_HTML)
         self.assertIn("revision<latestSessionRevision", WEB_DASHBOARD_HTML)
+        self.assertIn("server_instance_id", WEB_DASHBOARD_HTML)
         self.assertIn("cache:'no-store'", WEB_DASHBOARD_HTML)
         self.assertIn('id="btn-reset"', WEB_DASHBOARD_HTML)
         self.assertIn("post('/api/live/reset',{})", WEB_DASHBOARD_HTML)
@@ -376,6 +397,21 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(tracker.last_stable_board, middle)
         self.assertEqual(tracker.session_revision, 1)
 
+    def test_confirmed_last_mover_does_not_invent_three_ply_cycle(self):
+        middle = moved(self.start, "a3a4")
+        final = moved(middle, "a6a5")
+        tracker = self.tracker(middle, "b")
+
+        event = None
+        for _ in range(3):
+            event = tracker.update(matrix_to_fen(final), final, "b") or event
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["event_type"], "move")
+        self.assertEqual(event["move"]["uci"], "a6a5")
+        self.assertEqual(tracker.last_stable_board, final)
+        self.assertEqual(tracker.active_side, "r")
+
     def test_confirmed_visual_move_repairs_wrong_turn_lock(self):
         middle = moved(self.start, "a3a4")
         tracker = self.tracker(self.start, "b")
@@ -420,15 +456,154 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(tracker.active_side, "r")
         self.assertEqual(tracker.session_revision, original_revision + 1)
 
-    def test_same_game_reanchor_never_changes_piece_inventory(self):
+    def test_verified_undo_returns_to_recorded_board_and_turn(self):
+        first = moved(self.start, "a3a4")
+        second = moved(first, "a6a5")
         tracker = self.tracker(self.start)
-        compatible = self.start
-        for uci in ("a3a4", "a6a5", "c3c4", "c6c5"):
-            compatible = moved(compatible, uci)
-        self.assertTrue(tracker._inventory_compatible(self.start, compatible))
-        corrupted = [row[:] for row in compatible]
-        corrupted[9][1] = "r_r"
-        self.assertFalse(tracker._inventory_compatible(self.start, corrupted))
+        self.assertEqual(self.confirm(tracker, first)["event_type"], "move")
+        self.assertEqual(self.confirm(tracker, second)["event_type"], "move")
+        tracker.resync_frames = 3
+        tracker.resync_seconds = 0
+
+        event = None
+        for _ in range(4):
+            event = tracker.update(matrix_to_fen(first), first) or event
+        self.assertEqual(event["event_type"], "undo")
+        self.assertEqual(tracker.last_stable_board, first)
+        self.assertEqual(tracker.active_side, "b")
+        self.assertEqual(tracker.session_revision, 2)
+
+        alternative = moved(first, "c6c5")
+        self.assertEqual(self.confirm(tracker, alternative)["event_type"], "move")
+        self.assertEqual(tracker.active_side, "r")
+
+    def test_reversible_rook_undo_is_not_misread_as_a_new_rook_move(self):
+        first = moved(self.start, "a3a4")
+        second = moved(first, "a9a8")
+        tracker = self.tracker(self.start)
+        self.confirm(tracker, first)
+        self.confirm(tracker, second)
+        tracker.resync_frames = 3
+        tracker.resync_seconds = 0
+
+        self.assertIsNone(tracker.update(matrix_to_fen(first), first, "b"))
+        self.assertIsNone(tracker.update(matrix_to_fen(first), first, "b"))
+        event = tracker.update(matrix_to_fen(first), first, "b")
+        self.assertEqual(event["event_type"], "undo")
+        self.assertEqual(tracker.active_side, "b")
+
+    def test_undo_then_alternative_move_can_be_proven_without_rollback_frame(self):
+        first = moved(self.start, "a3a4")
+        second = moved(first, "a6a5")
+        alternative = moved(first, "c6c5")
+        tracker = self.tracker(self.start)
+        self.confirm(tracker, first)
+        self.confirm(tracker, second)
+        tracker.resync_frames = 3
+        tracker.resync_seconds = 0
+        visual = {
+            "side": "b", "piece": "b_p",
+            "from": {"row": 3, "col": 2},
+            "to": {"row": 4, "col": 2},
+        }
+
+        event = None
+        for _ in range(4):
+            event = tracker.update(
+                matrix_to_fen(alternative), alternative,
+                last_move_side="b", last_visual_move=visual,
+            ) or event
+        self.assertEqual(event["event_type"], "undo_branch")
+        self.assertEqual(event["move"]["uci"], "c6c5")
+        self.assertEqual(tracker.last_stable_board, alternative)
+        self.assertEqual(tracker.active_side, "r")
+
+    def test_undo_requires_complete_stable_observation(self):
+        first = moved(self.start, "a3a4")
+        second = moved(first, "a6a5")
+        tracker = self.tracker(self.start)
+        self.confirm(tracker, first)
+        self.confirm(tracker, second)
+        tracker.resync_frames = 3
+        tracker.resync_seconds = 0
+
+        for _ in range(8):
+            self.assertIsNone(tracker.update(
+                matrix_to_fen(first), first, complete_observation=False,
+            ))
+        self.assertEqual(tracker.last_stable_board, second)
+
+    def test_manual_reset_after_undo_uses_historical_turn_not_stale_marker(self):
+        first = moved(self.start, "a3a4")
+        second = moved(first, "a6a5")
+        tracker = self.tracker(self.start)
+        self.confirm(tracker, first)
+        self.confirm(tracker, second)
+        tracker.request_reanchor()
+
+        event = self.confirm(tracker, first, "r")
+        self.assertEqual(event["event_type"], "manual_reanchor")
+        self.assertEqual(tracker.last_stable_board, first)
+        self.assertEqual(tracker.active_side, "b")
+
+    def test_manual_reanchor_cannot_commit_isolated_piece_loss(self):
+        middle = moved(self.start, "a3a4")
+        tracker = self.tracker(middle, "b")
+        tracker.request_reanchor()
+        missing = [row[:] for row in middle]
+        missing[9][1] = None
+
+        for _ in range(12):
+            self.assertIsNone(tracker.update(matrix_to_fen(missing), missing))
+
+        self.assertEqual(tracker.last_stable_board, middle)
+        self.assertEqual(tracker.session_revision, 1)
+        self.assertIn("孤立少子", tracker.last_rejection_reason)
+
+    def test_persistent_missing_piece_never_reanchors_same_session(self):
+        tracker = self.tracker(self.start)
+        tracker.resync_frames = 2
+        tracker.resync_seconds = 0
+        missing = [row[:] for row in self.start]
+        missing[9][1] = None
+
+        for _ in range(20):
+            event = tracker.update(matrix_to_fen(missing), missing, "b")
+            self.assertIsNone(event)
+
+        self.assertEqual(tracker.last_stable_board, self.start)
+        self.assertIn("r_n", [piece for row in tracker.last_stable_board for piece in row])
+
+    def test_unproved_two_cell_relocation_never_uses_whole_board_reanchor(self):
+        tracker = self.tracker(self.start)
+        tracker.resync_frames = 2
+        tracker.resync_seconds = 0
+        corrupted = [row[:] for row in self.start]
+        corrupted[9][1] = None
+        corrupted[5][1] = "r_n"  # 马不能从 (1, 9) 一步到 (1, 5)
+
+        for _ in range(20):
+            event = tracker.update(matrix_to_fen(corrupted), corrupted, "r")
+            self.assertIsNone(event)
+
+        self.assertEqual(tracker.last_stable_board, self.start)
+
+    def test_empty_capture_gap_never_reanchors_an_arbitrary_midgame(self):
+        tracker = self.tracker(moved(self.start, "a3a4"), "b")
+        tracker.resync_frames = 2
+        tracker.resync_seconds = 0
+        before = [row[:] for row in tracker.last_stable_board]
+        for _ in range(3):
+            tracker.note_unstable_source(0)
+        wrong = [row[:] for row in before]
+        wrong[9][1] = None
+        wrong[5][1] = "r_n"  # Cannot be reached by one legal horse move.
+
+        for _ in range(12):
+            self.assertIsNone(tracker.update(matrix_to_fen(wrong), wrong, "r"))
+
+        self.assertEqual(tracker.last_stable_board, before)
+        self.assertEqual(tracker.session_revision, 1)
 
     def test_partial_two_ply_frame_is_not_committed_as_one(self):
         first = moved(self.start, "a3a4")
@@ -441,7 +616,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(event["event_type"], "catchup")
         self.assertEqual(tracker.active_side, "r")
 
-    def test_multi_ply_lag_reanchors_same_session_with_confirmed_hint(self):
+    def test_four_ply_lag_is_proven_before_catchup(self):
         tracker = self.tracker(self.start)
         tracker.resync_seconds = 0
         final = self.start
@@ -450,9 +625,51 @@ class RecoveryTests(unittest.TestCase):
         event = None
         for _ in range(4):
             event = tracker.update(matrix_to_fen(final), final, "b") or event
-        self.assertEqual(event["event_type"], "reanchor")
+        self.assertEqual(event["event_type"], "catchup")
+        self.assertEqual(len(event["moves"]), 4)
         self.assertEqual(tracker.active_side, "r")
         self.assertEqual(tracker.session_revision, 1)
+
+    def test_four_ply_catchup_proves_real_captures(self):
+        tracker = self.tracker(self.start, "r")
+        final = self.start
+        for uci in ("h2h9", "i9h9", "a3a4", "a6a5"):
+            final = moved(final, uci)
+
+        event = self.confirm(tracker, final, "b")
+        self.assertIsNotNone(event)
+        self.assertEqual(event["event_type"], "catchup")
+        self.assertEqual(len(event["moves"]), 4)
+        self.assertEqual(sum(piece is not None for row in final for piece in row), 30)
+        self.assertEqual(tracker.last_stable_board, final)
+
+    def test_persistent_false_addition_never_creates_ghost_piece(self):
+        middle = moved(self.start, "a3a4")
+        tracker = self.tracker(middle, "b")
+        corrupted = [row[:] for row in middle]
+        corrupted[5][8] = "r_n"
+
+        for _ in range(20):
+            self.assertIsNone(tracker.update(
+                matrix_to_fen(corrupted), corrupted, "r",
+            ))
+
+        self.assertEqual(tracker.last_stable_board, middle)
+
+    def test_pseudo_legal_move_exposing_flying_kings_is_rejected(self):
+        board = [[None] * 9 for _ in range(10)]
+        board[0][4] = "b_k"
+        board[5][4] = "r_r"
+        board[9][4] = "r_k"
+        tracker = self.tracker(board, "r")
+        illegal = [row[:] for row in board]
+        illegal[5][4] = None
+        illegal[5][5] = "r_r"
+
+        for _ in range(6):
+            self.assertIsNone(tracker.update(matrix_to_fen(illegal), illegal, "r"))
+
+        self.assertEqual(tracker.last_stable_board, board)
 
     def test_simulation_reanchors_recovered_board_and_turn(self):
         middle = moved(self.start, "a3a4")

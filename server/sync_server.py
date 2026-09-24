@@ -13,6 +13,7 @@ import time
 import asyncio
 import threading
 import http.server
+import uuid
 from typing import Optional, Dict, Any, Set
 import numpy as np
 
@@ -339,7 +340,9 @@ class SyncServer:
         self._reset_requested = threading.Event()
         self._manual_reset_active = False
         self._manual_reset_deadline = 0.0
-        self._manual_reset_timeout = 2.5
+        # Eight stable mini-program frames can take over two seconds at the
+        # idle polling rate, especially after rebuilding the grid from scratch.
+        self._manual_reset_timeout = 6.0
         self._pending_since = 0.0
         self._last_tracking_refresh = 0.0
         self._consecutive_pipeline_errors = 0
@@ -347,6 +350,7 @@ class SyncServer:
         # 线程安全共享状态
         self._lock = threading.Lock()
         self._latest_state: Dict[str, Any] = {
+            "server_instance_id": uuid.uuid4().hex,
             "fen": "",
             "board": [],
             "text_board": "",
@@ -360,6 +364,9 @@ class SyncServer:
             "last_frame_at": 0.0,
             "capture_info": self.capture.get_info(),
             "manual_reset_pending": False,
+            "tracking_mode": "legal_moves",
+            "tracking_status": "waiting",
+            "catchup_max_plies": 4,
             "ai": None,
         }
         self.advisor = AIAdvisor(
@@ -487,6 +494,7 @@ class SyncServer:
             "recognition_pending": True,
             "recognition_rejection": "正在后台重新读取当前对局",
             "capture_status": "resetting",
+            "tracking_status": "verifying",
             "manual_reset_pending": True,
             "description": "正在后台重新读取当前对局，旧盘面会保留到新盘面就绪",
         })
@@ -510,6 +518,7 @@ class SyncServer:
         self._update_state({
             "manual_reset_pending": False,
             "capture_status": "ok" if has_board else "waiting",
+            "tracking_status": "synced" if has_board else "waiting",
             "description": (
                 "未获得新的完整帧，已继续使用当前稳定盘面"
                 if has_board else "等待棋盘画面恢复"
@@ -639,6 +648,7 @@ class SyncServer:
                 poll_interval = self._effective_poll_interval(capture_info)
                 self._update_state({
                     "capture_status": "error",
+                    "tracking_status": "holding",
                     "recognition_pending": True,
                     "recognition_rejection": "画面通道短暂异常，正在自动重新连接",
                     "manual_reset_pending": self._manual_reset_active,
@@ -720,6 +730,7 @@ class SyncServer:
                             occupancy,
                             rec_result.get("occupied_sides"),
                             rec_result.get("last_visual_move"),
+                            complete_observation=manual_candidate_complete,
                         )
                     else:
                         event = None
@@ -755,6 +766,7 @@ class SyncServer:
                             "raw_piece_count": raw_piece_count,
                             "recognition_pending": True,
                             "capture_status": "waiting",
+                            "tracking_status": "waiting",
                             "manual_reset_pending": self._manual_reset_active,
                             "description": self.debouncer.last_rejection_reason or "等待进入有效棋局",
                             "recognition_rejection": (
@@ -815,6 +827,9 @@ class SyncServer:
                         "timestamp": now,
                         "fps": round(fps, 1),
                         "capture_status": "resetting" if self._manual_reset_active else "ok",
+                        "tracking_mode": "legal_moves",
+                        "tracking_status": "verifying" if recognition_pending else "synced",
+                        "catchup_max_plies": 4,
                         "manual_reset_pending": self._manual_reset_active,
                         "last_frame_at": now,
                         "frame_resolution": f"{frame.shape[1]}x{frame.shape[0]}",
@@ -866,6 +881,7 @@ class SyncServer:
                     poll_interval = self._effective_poll_interval(capture_info)
                     self._update_state({
                         "capture_status": "error",
+                        "tracking_status": "holding",
                         "recognition_pending": True,
                         "recognition_rejection": "识别遇到临时异常，正在自动重建",
                         "manual_reset_pending": self._manual_reset_active,
@@ -884,6 +900,7 @@ class SyncServer:
                 capture_error = capture_info.get("last_error")
                 self._update_state({
                     "capture_status": "error",
+                    "tracking_status": "holding",
                     "manual_reset_pending": self._manual_reset_active,
                     "capture_info": capture_info,
                     "poll_interval": poll_interval,

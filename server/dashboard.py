@@ -26,6 +26,7 @@ svg{display:block;width:100%;height:100%}
 .btn:disabled{opacity:.45;cursor:default}
 .setting{display:flex;align-items:center;gap:6px;font-size:13px;color:#52604f}.setting input,.setting select{width:78px;border:1px solid #b8c4b1;border-radius:8px;padding:6px 8px;background:#fffdf7;color:#283526;font-weight:700}.setting select{width:112px}
 .think{width:8px;height:8px;border-radius:50%;background:#ba382d;display:inline-block;margin-right:6px;box-shadow:0 0 0 0 rgba(186,56,45,.6);animation:pulse 1.2s infinite}
+.think[hidden]{display:none}
 @keyframes pulse{70%{box-shadow:0 0 0 8px rgba(186,56,45,0)}}
 </style>
 </head>
@@ -34,12 +35,12 @@ svg{display:block;width:100%;height:100%}
 <section class="dock">
   <div class="row">
     <span class="badge" id="side-badge">AI 执下方</span>
-    <span class="status" id="status">正在连接盘面…</span>
+    <span class="status" id="status"><span class="think" id="thinking" hidden></span><span id="status-message">正在连接盘面…</span></span>
     <span class="meta" id="score"></span>
   </div>
   <div class="row">
     <span class="suggest" id="suggest">等待建议</span>
-    <span class="meta">实时只读 · 自动跟随实盘</span>
+    <span class="meta">实时只读 · 合法走子跟踪</span>
   </div>
   <div class="row">
     <div class="setting"><label for="ai-level">AI 强度</label><select id="ai-level"><option value="eco">节能</option><option value="normal">普通</option><option value="advanced">进阶</option><option value="expert">高级</option></select></div>
@@ -51,10 +52,13 @@ svg{display:block;width:100%;height:100%}
 const text={r_k:"帥",r_a:"仕",r_b:"相",r_n:"傌",r_r:"俥",r_c:"炮",r_p:"兵",b_k:"将",b_a:"士",b_b:"象",b_n:"馬",b_r:"車",b_c:"砲",b_p:"卒"};
 const root=document.querySelector('#board');
 const x=c=>70+c*95,y=r=>70+r*95;
-let board=[], ai=null, lastMove=null, gameName='象棋',lastRenderSignature='';
-let latestSessionRevision=-1,latestStateTimestamp=0,currentSessionRevision=0,ws=null,reconnectTimer=null;
+let board=[], ai=null, lastMove=null, gameName='象棋';
+let latestSessionRevision=-1,latestStateTimestamp=0,latestServerId='',ws=null,reconnectTimer=null;
 let syncDescription='',recognitionPending=false,captureStatus='waiting';
 let resetRequestedAt=0,manualResetPending=false;
+let resetWatchdog=null;
+const pieceNodes=new Map();
+let lastArrowSignature='',suggestionArrowSignature='';
 
 function grid(){
   let s='<rect x="24" y="24" width="852" height="952" rx="28" fill="url(#wood)" stroke="#a4ab94" stroke-width="10"/><rect x="52" y="52" width="796" height="896" rx="10" fill="#b9c1aa" stroke="#8e9882" stroke-width="5"/>';
@@ -71,57 +75,86 @@ function arrow(from,to,color){
   return `<line x1="${x(from.col)}" y1="${y(from.row)}" x2="${x(to.col)}" y2="${y(to.row)}" stroke="${color}" stroke-width="10" stroke-linecap="round" marker-end="url(#arr)" opacity=".9"/>`;
 }
 
-function render(){
-  const renderSignature=JSON.stringify([
-    currentSessionRevision,board,lastMove,ai&&ai.suggestion
-  ]);
-  if(renderSignature===lastRenderSignature)return;
-  let s=`<svg viewBox="0 0 900 1000" role="img" aria-label="实时象棋盘面"><defs>
+function initBoard(){
+  root.innerHTML=`<svg viewBox="0 0 900 1000" role="img" aria-label="实时象棋盘面"><defs>
     <linearGradient id="wood" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#d8dfc8"/><stop offset="1" stop-color="#aab59f"/></linearGradient>
     <radialGradient id="face"><stop stop-color="#fff9dd"/><stop offset=".72" stop-color="#f7ddb1"/><stop offset="1" stop-color="#c99757"/></radialGradient>
     <filter id="shadow" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="2" dy="5" stdDeviation="4" flood-color="#42503d" flood-opacity=".38"/></filter>
     <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#c45c38"/></marker>
-  </defs>${grid()}`;
+  </defs>${grid()}<g id="last-arrow"></g><g id="suggestion-arrow"></g><g id="pieces"></g></svg>`;
+}
+
+function makePiece(p,r,c){
+  const red=p.startsWith('r_'),ink=red?'#ba382d':'#242922',rim=red?'#d39a62':'#b98952';
+  const node=document.createElementNS('http://www.w3.org/2000/svg','g');
+  node.setAttribute('transform',`translate(${x(c)} ${y(r)})`);
+  node.setAttribute('filter','url(#shadow)');
+  node.setAttribute('data-piece',p);
+  node.innerHTML=`<circle r="43" fill="${rim}" stroke="#8b603d" stroke-width="3"/>
+    <circle r="35" fill="url(#face)" stroke="#f9edc5" stroke-width="3"/>
+    <text class="piece-char" fill="${ink}">${text[p]}</text>`;
+  return node;
+}
+
+function render(){
+  const pieces=root.querySelector('#pieces');
+  if(!pieces)return;
+  for(let r=0;r<10;r++){
+    for(let c=0;c<9;c++){
+      const p=Array.isArray(board)&&Array.isArray(board[r])?board[r][c]:null;
+      const key=`${r}-${c}`,previous=pieceNodes.get(key);
+      if(previous&&previous.getAttribute('data-piece')===p)continue;
+      if(previous){previous.remove();pieceNodes.delete(key);}
+      if(p&&text[p]){
+        const node=makePiece(p,r,c);
+        pieces.appendChild(node);
+        pieceNodes.set(key,node);
+      }
+    }
+  }
   const sug=ai&&ai.suggestion;
-  if(lastMove&&lastMove.from&&lastMove.to)s+=arrow(lastMove.from,lastMove.to,'#5b7c9a');
-  if(sug&&sug.from&&sug.to)s+=arrow(sug.from,sug.to,'#c45c38');
-  (Array.isArray(board)?board:[]).forEach((row,r)=>(row||[]).forEach((p,c)=>{
-    if(!p||!text[p])return;
-    const red=p.startsWith('r_'),ink=red?'#ba382d':'#242922',rim=red?'#d39a62':'#b98952';
-    s+=`<g transform="translate(${x(c)} ${y(r)})" filter="url(#shadow)">
-      <circle r="43" fill="${rim}" stroke="#8b603d" stroke-width="3"/>
-      <circle r="35" fill="url(#face)" stroke="#f9edc5" stroke-width="3"/>
-      <text class="piece-char" fill="${ink}">${text[p]}</text></g>`;
-  }));
-  root.innerHTML=s+'</svg>';
-  lastRenderSignature=renderSignature;
+  const lastArrow=lastMove&&lastMove.from&&lastMove.to
+    ?arrow(lastMove.from,lastMove.to,'#5b7c9a'):'';
+  const suggestionArrow=sug&&sug.from&&sug.to
+    ?arrow(sug.from,sug.to,'#c45c38'):'';
+  if(lastArrow!==lastArrowSignature){
+    root.querySelector('#last-arrow').innerHTML=lastArrow;
+    lastArrowSignature=lastArrow;
+  }
+  if(suggestionArrow!==suggestionArrowSignature){
+    root.querySelector('#suggestion-arrow').innerHTML=suggestionArrow;
+    suggestionArrowSignature=suggestionArrow;
+  }
 }
 
 function renderDock(){
   const badge=document.getElementById('side-badge');
   const status=document.getElementById('status');
+  const statusMessage=document.getElementById('status-message');
+  const thinking=document.getElementById('thinking');
   const suggest=document.getElementById('suggest');
   const score=document.getElementById('score');
   const levelInput=document.getElementById('ai-level');
   const resetButton=document.getElementById('btn-reset');
-  if(!ai){status.textContent='正在连接盘面…';return;}
+  const setText=(node,value)=>{if(node.textContent!==value)node.textContent=value;};
+  if(!ai){setText(statusMessage,'正在连接盘面…');thinking.hidden=true;return;}
   const engineLabel='Pikafish';
-  badge.textContent=`${gameName} · 跟随实盘 · AI 执下方 · ${ai.bottom_label||''} · ${engineLabel}`;
+  setText(badge,`${gameName} · 跟随实盘 · AI 执下方 · ${ai.bottom_label||''} · ${engineLabel}`);
   const rebuilding=manualResetPending;
-  status.textContent=rebuilding?'正在后台重新读取当前对局，当前盘面会暂时保留…':((recognitionPending&&syncDescription)||ai.error||ai.status||syncDescription||'');
-  if(ai.thinking){const dot=document.createElement('span');dot.className='think';status.prepend(dot);}
+  setText(statusMessage,rebuilding?'正在后台重新读取当前对局，当前盘面会暂时保留…':((recognitionPending&&syncDescription)||ai.error||ai.status||syncDescription||''));
+  thinking.hidden=!ai.thinking;
   status.title=ai.engine_error||'';
-  suggest.textContent=rebuilding?'正在重新读取盘面':((ai.suggestion&& (ai.suggestion.zh||ai.suggestion.uci)) || (ai.to_move==='unknown'?'等待确认回合':(ai.play_mode?'请走上方棋子':'等待下方建议')));
+  setText(suggest,rebuilding?'正在重新读取盘面':((ai.suggestion&& (ai.suggestion.zh||ai.suggestion.uci)) || (ai.to_move==='unknown'?'等待确认回合':(ai.play_mode?'请走上方棋子':'等待下方建议'))));
   if(ai.suggestion&&typeof ai.suggestion.score==='number'){
     const v=(ai.suggestion.score/100).toFixed(2);
-    score.textContent=`${engineLabel} · 深度 ${ai.suggestion.depth||0} · ${(ai.suggestion.nodes||0).toLocaleString()}节点 · 评估 ${v}`;
-  }else score.textContent='实盘助手';
+    setText(score,`${engineLabel} · 深度 ${ai.suggestion.depth||0} · ${(ai.suggestion.nodes||0).toLocaleString()}节点 · 评估 ${v}`);
+  }else setText(score,'实盘助手');
   if(document.activeElement!==levelInput){
     levelInput.value=(ai.time_ms>=8000&&ai.engine_threads>=6)?'expert':((ai.time_ms>=3000&&ai.engine_threads>=4)?'advanced':((ai.time_ms>=1000&&ai.engine_threads>=2)?'normal':'eco'));
   }
   if(resetButton){
     resetButton.disabled=rebuilding;
-    resetButton.textContent=rebuilding?'正在重新读取…':'清理缓存并重新读取对局';
+    setText(resetButton,rebuilding?'正在重新读取…':'清理缓存并重新读取对局');
   }
 }
 
@@ -135,6 +168,13 @@ async function post(path, body){
 function applyAi(data){
   const revision=Number(data.session_revision||0);
   const timestamp=Number(data.timestamp||0);
+  const serverId=String(data.server_instance_id||'');
+  if(serverId&&serverId!==latestServerId){
+    if(latestServerId&&timestamp&&timestamp<latestStateTimestamp)return;
+    latestServerId=serverId;
+    latestSessionRevision=-1;
+    latestStateTimestamp=0;
+  }
   if(revision<latestSessionRevision)return;
   if(revision===latestSessionRevision&&timestamp&&timestamp<latestStateTimestamp)return;
   if(revision>latestSessionRevision){
@@ -142,13 +182,15 @@ function applyAi(data){
     latestStateTimestamp=0;
   }
   if(timestamp)latestStateTimestamp=Math.max(latestStateTimestamp,timestamp);
-  currentSessionRevision=revision;
   if(data.game_name) gameName=data.game_name;
   syncDescription=(data.recognition_pending&&data.recognition_rejection)||data.description||'';
   recognitionPending=Boolean(data.recognition_pending);
   captureStatus=data.capture_status||captureStatus;
   manualResetPending=Boolean(data.manual_reset_pending);
-  if(!manualResetPending)resetRequestedAt=0;
+  if(!manualResetPending){
+    resetRequestedAt=0;
+    if(resetWatchdog){clearTimeout(resetWatchdog);resetWatchdog=null;}
+  }
   if(data.ai) ai=data.ai;
   if(ai&&ai.play_mode&&ai.board) board=ai.board;
   else if(data.board) board=data.board;
@@ -162,7 +204,8 @@ function applyAi(data){
 
 function showError(error){
   console.error(error);
-  document.getElementById('status').textContent=`操作失败：${error.message}`;
+  document.getElementById('thinking').hidden=true;
+  document.getElementById('status-message').textContent=`操作失败：${error.message}`;
 }
 document.getElementById('ai-level').onchange=async ev=>{
   const presets={
@@ -177,7 +220,7 @@ document.getElementById('ai-level').onchange=async ev=>{
   try{applyAi(await post('/api/ai/config',{engine_kind:'pikafish',...presets[chosen]}));}
   catch(error){
     renderDock();
-    document.getElementById('status').textContent=`AI 强度切换失败：${error.message}`;
+    document.getElementById('status-message').textContent=`AI 强度切换失败：${error.message}`;
   }finally{select.disabled=false;}
 };
 document.getElementById('btn-reset').onclick=async ev=>{
@@ -185,10 +228,27 @@ document.getElementById('btn-reset').onclick=async ev=>{
   resetRequestedAt=Date.now();
   button.disabled=true;
   button.textContent='正在重新读取…';
+  if(resetWatchdog)clearTimeout(resetWatchdog);
+  resetWatchdog=setTimeout(async()=>{
+    if(!manualResetPending)return;
+    await refreshSnapshot();
+    if(manualResetPending){
+      manualResetPending=false;
+      resetRequestedAt=0;
+      renderDock();
+      document.getElementById('status-message').textContent='重读等待超时，请检查棋盘画面后重试';
+    }
+    resetWatchdog=null;
+  },8500);
   try{
     latestStateTimestamp=0;
     applyAi(await post('/api/live/reset',{}));
-  }catch(error){resetRequestedAt=0;showError(error);renderDock();}
+  }catch(error){
+    resetRequestedAt=0;
+    if(resetWatchdog){clearTimeout(resetWatchdog);resetWatchdog=null;}
+    manualResetPending=false;
+    renderDock();showError(error);
+  }
 };
 function connect(){
   if(ws&&(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING))return;
@@ -214,7 +274,7 @@ async function initialize(){
   await refreshSnapshot();
   setInterval(refreshSnapshot,600);
 }
-render(); initialize();
+initBoard(); render(); initialize();
 })();
 </script>
 </body>
