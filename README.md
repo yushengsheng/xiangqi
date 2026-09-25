@@ -39,6 +39,14 @@ python3.11 -m venv venv
 
 源码启动自动使用 `venv/`；自包含发布包优先使用随包的 `runtime/`。`build_release.sh` 和完整启动器回归依赖自包含运行时，源码仓库本身不提供它；不要将虚拟环境或个人配置提交到仓库。
 
+### macOS 微信小程序（代码适配，待 Mac 实机验收）
+
+Mac 版现在会识别「微信 / WeChat / Weixin」窗口，并把选中的微信窗口固定走 CoreGraphics 采集与微信小程序棋子模板；即使应用宝同时运行，也不会把微信棋局误接到应用宝 ADB 画面。微信窗口需要 macOS「屏幕录制」授权，不能沿用应用宝 ADB 的免授权通道。横屏、窄窗和纵向拉长窗口会重新尝试定位棋盘。
+
+如果同时打开应用宝或多个微信窗口，先用 `./python.sh main.py --list-windows` 找到棋局 Window ID；首次使用先执行 `./python.sh main.py --window-id <当前ID> --request-screen-permission` 并按系统提示授权、重启启动器或终端，再执行 `./python.sh main.py --window-id <当前ID> --capture-once logs/wechat_check.png`，确认图片确为当前棋盘。之后用相同 `--window-id` 启动实时服务。也可用 `--window "微信"` 按窗口名选择。检查 `/api/status` 中的 `capture_info.window_kind` 为 `wechat`、`capture_info.source` 为 `wechat_coregraphics`，且 `capture_status` 为 `ok`。Window ID 在微信重开后可能变化，程序会优先重找微信窗口而非跳到应用宝。
+
+这些路径已通过隔离的窗口模拟和微信棋盘图片回归，但尚未在真实 Mac 微信窗口完成授权、抓帧与连续走棋验收；不能把代码级通过当成实机通过。GitHub 源码仍需先安装上方所列的 Python 依赖，不是可直接双击的自包含发布包。
+
 ## 运行方式
 
 在项目目录中执行：

@@ -396,11 +396,11 @@ class SyncServer:
         source = (capture_info or {}).get("source")
         if recognition_pending:
             return self.interval
-        if not has_stable_board and source in ("yyb_adb", "coregraphics"):
+        if not has_stable_board and source in ("yyb_adb", "coregraphics", "wechat_coregraphics"):
             return max(self.interval, 0.5)
         if source == "yyb_adb":
             return max(self.interval, 0.75)
-        if source == "coregraphics" and has_stable_board:
+        if source in ("coregraphics", "wechat_coregraphics") and has_stable_board:
             return max(self.interval, 0.30)
         if source == "windows_graphics_capture" and has_stable_board:
             return max(self.interval, 0.25)

@@ -29,7 +29,8 @@ class MacCapture(BaseCapture):
         self.target_title = target_title
         self.target_wid = target_wid
         self.fallback_keywords = fallback_keywords or [
-            "JJ象棋", "JJ 象棋", "腾讯应用宝", "应用宝", "天天象棋"
+            "JJ象棋", "JJ 象棋", "腾讯应用宝", "应用宝", "天天象棋",
+            "微信", "WeChat", "Weixin",
         ]
         self.target_window_info: Optional[Dict[str, Any]] = None
         self.last_error: Optional[str] = None
@@ -39,6 +40,7 @@ class MacCapture(BaseCapture):
         self.permission_state = "unknown"
         self.game_id = "unknown"
         self.game_name = "未识别"
+        self._wechat_window = bool(target_title and self._is_wechat_name(target_title))
         self.capture_source = "coregraphics"
         self._adb_path: Optional[str] = None
         self._adb_device: Optional[str] = None
@@ -243,13 +245,59 @@ class MacCapture(BaseCapture):
         except Exception:
             return []
 
+    @staticmethod
+    def _is_wechat_name(value: str) -> bool:
+        lowered = value.lower()
+        return any(name in lowered for name in ("微信", "wechat", "weixin"))
+
+    @classmethod
+    def _is_wechat_window(cls, window: Dict[str, Any]) -> bool:
+        return cls._is_wechat_name(str(window.get("app", ""))) or cls._is_wechat_name(
+            str(window.get("title", ""))
+        )
+
+    @staticmethod
+    def _wechat_window_priority(window: Dict[str, Any]):
+        title = str(window.get("title", "")).lower()
+        bounds = window.get("bounds") or (0, 0, 0, 0)
+        width, height = int(bounds[2]), int(bounds[3])
+        return (
+            int("象棋" in title or "chess" in title),
+            int(width > height),
+            width * height,
+        )
+
+    def _activate_window(self, window: Dict[str, Any]) -> Dict[str, Any]:
+        is_wechat = self._is_wechat_window(window)
+        changed = self.target_wid != window["id"] or self._wechat_window != is_wechat
+        if changed:
+            self._adb_display_id = None
+            self._tiantian_source = (
+                "window" if is_wechat else (
+                    "adb" if self.game_id == "tiantian"
+                    and self._adb_path and self._adb_device else "auto"
+                )
+            )
+            self._source_bad_frames = 0
+            self._probing_window = False
+        if is_wechat:
+            # Desktop WeChat is not the Android emulator.  Never use its ADB
+            # channel even when another Tiantian game happens to be open.
+            self.game_id, self.game_name = "tiantian", "天天象棋（微信）"
+        elif self._wechat_window:
+            self.game_id, self.game_name = "unknown", "未识别"
+        self._wechat_window = is_wechat
+        self.target_window_info = window
+        self.target_wid = window["id"]
+        self.last_error = None
+        return window
+
     def find_target_window(self) -> Optional[Dict[str, Any]]:
         windows = self.list_windows()
         if self.target_wid is not None:
             for window in windows:
                 if window["id"] == self.target_wid:
-                    self.target_window_info = window
-                    return window
+                    return self._activate_window(window)
             # 客户端重启后 Window ID 会变化；旧 ID 失效时继续按标题/应用名找新窗口。
             self.last_error = f"Window ID={self.target_wid} 已失效，正在自动重新查找象棋窗口"
 
@@ -258,26 +306,22 @@ class MacCapture(BaseCapture):
             if not candidate:
                 continue
             needle = candidate.lower()
+            matching = []
             for window in windows:
+                if self._wechat_window and not self._is_wechat_window(window):
+                    continue
                 searchable = " ".join(
                     [window["display_name"], window["app"], window["title"]]
                 ).lower()
                 if needle in searchable:
-                    if self.target_wid != window["id"]:
-                        self._adb_display_id = None
-                        self._tiantian_source = (
-                            "adb" if self.game_id == "tiantian"
-                            and self._adb_path and self._adb_device else "auto"
-                        )
-                        self._source_bad_frames = 0
-                        self._probing_window = False
-                    self.target_window_info = window
-                    self.target_wid = window["id"]
-                    self.last_error = None
-                    return window
+                    matching.append(window)
+            if matching:
+                if self._is_wechat_name(candidate):
+                    matching.sort(key=self._wechat_window_priority, reverse=True)
+                return self._activate_window(matching[0])
 
         self.target_window_info = None
-        self.last_error = "未找到 JJ/天天象棋/应用宝窗口；可运行 --list-windows 后用 --window-id 指定"
+        self.last_error = "未找到象棋/应用宝/微信窗口；可运行 --list-windows 后用 --window-id 指定"
         return None
 
     def _cgimage_to_bgr(self, image: Any) -> Optional[np.ndarray]:
@@ -299,8 +343,13 @@ class MacCapture(BaseCapture):
 
     def request_screen_permission(self) -> bool:
         """显式请求录屏；天天象棋使用应用宝画面通道，无需系统授权。"""
-        self._detect_yyb_game(force=True)
-        if self.game_id == "tiantian" and self._adb_path and self._adb_device:
+        self.find_target_window()
+        if not self._wechat_window:
+            self._detect_yyb_game(force=True)
+        if (
+            not self._wechat_window and self.game_id == "tiantian"
+            and self._adb_path and self._adb_device
+        ):
             # ADB 画面已包含完整实盘和落点光圈，不为天天象棋
             # 额外申请可捕获整个桌面的 macOS 录屏权限。
             self.permission_state = "not_required"
@@ -343,8 +392,11 @@ class MacCapture(BaseCapture):
 
     def capture(self) -> Optional[np.ndarray]:
         """优先捕获已授权宿主窗口，天天象棋可回退至应用宝显示通道。"""
-        self._detect_yyb_game()
-        if self.game_id == "tiantian":
+        if self.target_window_info is None and (self.target_title or self.target_wid):
+            self.find_target_window()
+        if not self._wechat_window:
+            self._detect_yyb_game()
+        if self.game_id == "tiantian" and not self._wechat_window:
             window_allowed = (
                 self._quartz is not None and self._quartz.CGPreflightScreenCaptureAccess()
             )
@@ -392,7 +444,7 @@ class MacCapture(BaseCapture):
             )
             frame = self._cgimage_to_bgr(image)
             if frame is None or frame.size == 0:
-                if self.game_id == "tiantian":
+                if self.game_id == "tiantian" and not self._wechat_window:
                     self._tiantian_source = "adb"
                 self.last_error = "CoreGraphics 未返回有效窗口图像"
                 return None
@@ -413,23 +465,23 @@ class MacCapture(BaseCapture):
                 self.last_content_crop = None
             # 极低方差的全黑/透明画面通常是被系统或应用阻止的窗口抓取结果。
             if float(frame.std()) < 2.0:
-                if self.game_id == "tiantian":
+                if self.game_id == "tiantian" and not self._wechat_window:
                     self._tiantian_source = "adb"
                 self.last_error = "目标窗口图像近乎全黑，可能被应用或系统阻止捕获"
                 return None
             self.frame_count += 1
-            self.capture_source = "coregraphics"
+            self.capture_source = "wechat_coregraphics" if self._wechat_window else "coregraphics"
             self.last_error = None
             return frame
         except Exception as exc:
-            if self.game_id == "tiantian":
+            if self.game_id == "tiantian" and not self._wechat_window:
                 self._tiantian_source = "adb"
             self.last_error = f"CoreGraphics 窗口截取失败: {exc}"
             return None
 
     def report_recognition(self, piece_count: int, has_both_kings: bool) -> None:
         """自动选择天天象棋的人机 ADB 画面或真人宿主窗口画面。"""
-        if self.game_id != "tiantian":
+        if self.game_id != "tiantian" or self._wechat_window:
             return
         if has_both_kings:
             self._source_bad_frames = 0
@@ -461,9 +513,11 @@ class MacCapture(BaseCapture):
             self._source_bad_frames = 0
 
     def is_available(self) -> bool:
+        window_available = self.find_target_window() is not None
+        if self._wechat_window:
+            return self._quartz is not None and window_available
         self._detect_yyb_game(force=True)
-        window_available = self._quartz is not None and self.find_target_window() is not None
-        return window_available or (
+        return (self._quartz is not None and window_available) or (
             self.game_id == "tiantian" and self._adb_path is not None and self._adb_device is not None
         )
 
@@ -477,6 +531,7 @@ class MacCapture(BaseCapture):
             "permission": self.permission_state,
             "game_id": self.game_id,
             "game_name": self.game_name,
+            "window_kind": "wechat" if self._wechat_window else "native",
             "source": self.capture_source,
             "frame_count": self.frame_count,
             "raw_resolution": self.last_raw_resolution,

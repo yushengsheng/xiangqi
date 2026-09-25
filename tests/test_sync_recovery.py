@@ -821,6 +821,114 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(capture.permission_state, "not_required")
         capture._quartz.CGRequestScreenCaptureAccess.assert_not_called()
 
+    def test_macos_wechat_window_uses_quartz_even_with_emulator_adb(self):
+        capture = self.capture()
+        capture.target_title = "微信"
+        capture._adb_path = "/existing/adb"
+        capture._adb_device = "emulator-5554"
+        capture._quartz = Mock()
+        capture._quartz.CGPreflightScreenCaptureAccess.return_value = True
+        capture._quartz.CGRequestScreenCaptureAccess.return_value = True
+        capture._detect_yyb_game = Mock(return_value="tiantian")
+        capture._capture_tiantian_adb = Mock()
+        windows = [
+            {"id": 10, "app": "WeChat", "title": "微信", "display_name": "WeChat - 微信",
+             "bounds": (0, 0, 600, 800)},
+            {"id": 11, "app": "微信", "title": "天天象棋", "display_name": "微信 - 天天象棋",
+             "bounds": (0, 0, 1756, 1055)},
+        ]
+        capture.list_windows = Mock(return_value=windows)
+
+        self.assertTrue(capture.is_available())
+        self.assertEqual(capture.target_wid, 11)
+        self.assertEqual(capture.get_info()["window_kind"], "wechat")
+        self.assertEqual(capture.game_id, "tiantian")
+        self.assertTrue(capture.request_screen_permission())
+        capture._quartz.CGRequestScreenCaptureAccess.assert_called_once()
+        capture._detect_yyb_game.assert_not_called()
+
+        frame = cv2.imread("test_images/tiantian_wechat_miniprogram.png")
+        self.assertIsNotNone(frame)
+        capture._cgimage_to_bgr = Mock(return_value=frame)
+        observed = capture.capture()
+        self.assertIsNotNone(observed)
+        capture._capture_tiantian_adb.assert_not_called()
+        capture._quartz.CGWindowListCreateImage.assert_called()
+        self.assertEqual(capture.get_info()["source"], "wechat_coregraphics")
+        capture.report_recognition(0, False)
+        self.assertEqual(capture._tiantian_source, "window")
+
+        recognizer = TiantianRecognizer()
+        recognizer.capture_source = capture.get_info()["source"]
+        result = recognizer.recognize(observed)
+        self.assertEqual(result["recognition_profile"], "wechat_miniprogram")
+        self.assertTrue(result["recognition_valid"])
+        self.assertEqual(result["piece_count"], 32)
+
+        # A tall resized WeChat window must still use mini-program templates.
+        portrait = cv2.copyMakeBorder(
+            observed, 550, 550, 0, 0, cv2.BORDER_CONSTANT,
+            value=(55, 43, 31),
+        )
+        self.assertLess(portrait.shape[1], portrait.shape[0])
+        recognizer.reset_tracking()
+        portrait_result = recognizer.recognize(portrait)
+        self.assertEqual(portrait_result["recognition_profile"], "wechat_miniprogram")
+        self.assertTrue(portrait_result["recognition_valid"])
+        self.assertEqual(portrait_result["piece_count"], 32)
+
+        # A denied/empty Quartz frame must not arm the emulator fallback.
+        capture._cgimage_to_bgr = Mock(return_value=None)
+        self.assertIsNone(capture.capture())
+        self.assertEqual(capture._tiantian_source, "window")
+        capture._capture_tiantian_adb.assert_not_called()
+
+    def test_macos_reopened_wechat_stays_with_wechat_not_emulator(self):
+        capture = self.capture()
+        capture.target_wid = 11
+        capture._wechat_window = True
+        capture.game_id = "tiantian"
+        capture._adb_path = "/existing/adb"
+        capture._adb_device = "emulator-5554"
+        capture.list_windows = Mock(return_value=[
+            {"id": 20, "app": "腾讯应用宝", "title": "天天象棋",
+             "display_name": "腾讯应用宝 - 天天象棋", "bounds": (0, 0, 440, 818)},
+            {"id": 21, "app": "WeChat", "title": "天天象棋",
+             "display_name": "WeChat - 天天象棋", "bounds": (0, 0, 1500, 920)},
+        ])
+
+        self.assertEqual(capture.find_target_window()["id"], 21)
+        self.assertEqual(capture.get_info()["window_kind"], "wechat")
+        self.assertEqual(capture._tiantian_source, "window")
+
+    def test_macos_auto_finds_landscape_wechat_miniprogram(self):
+        capture = self.capture()
+        capture._quartz = Mock()
+        capture._detect_yyb_game = Mock()
+        capture.list_windows = Mock(return_value=[
+            {"id": 30, "app": "微信", "title": "微信",
+             "display_name": "微信 - 微信", "bounds": (0, 0, 620, 850)},
+            {"id": 31, "app": "WeChat", "title": "微信小程序",
+             "display_name": "WeChat - 微信小程序", "bounds": (0, 0, 1450, 900)},
+        ])
+
+        self.assertTrue(capture.is_available())
+        self.assertEqual(capture.target_wid, 31)
+        self.assertEqual(capture.game_id, "tiantian")
+        capture._detect_yyb_game.assert_not_called()
+
+    def test_macos_wechat_capture_uses_existing_quartz_poll_budget(self):
+        server = SyncServer.__new__(SyncServer)
+        server.interval = 0.12
+        source = {"source": "wechat_coregraphics"}
+        self.assertEqual(server._effective_poll_interval(source), 0.5)
+        self.assertEqual(server._effective_poll_interval(
+            source, has_stable_board=True,
+        ), 0.30)
+        self.assertEqual(server._effective_poll_interval(
+            source, has_stable_board=True, recognition_pending=True,
+        ), 0.12)
+
     def test_window_reopen_discards_old_source_cache(self):
         capture = self.capture()
         capture.target_wid = 1

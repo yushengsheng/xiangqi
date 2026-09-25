@@ -901,10 +901,13 @@ class TiantianRecognizer:
         self._cache_generation += 1
         height, width = image.shape[:2]
         host_frame = (
-            self.capture_source == "coregraphics"
+            self.capture_source in ("coregraphics", "wechat_coregraphics")
             or (self.capture_source != "adb" and height < 2200)
         )
-        mini_program_frame = host_frame and width > height
+        mini_program_frame = (
+            self.capture_source == "wechat_coregraphics"
+            or (host_frame and width > height)
+        )
         if mini_program_frame:
             # Windows may now be either the native 天天 client or the WeChat
             # mini-program. Cold-start both skins, then pin the winner.
